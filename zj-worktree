@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  zj-worktree --branch <branch> --tab <name> [--prompt <text>]
+  zj-worktree --branch <branch> --tab <name> --resume
+  zj-worktree --dir <path> --tab <name> [--prompt <text>]
+
+Create a new zellij tab with Claude running in a git worktree.
+
+Options:
+  --branch <branch>  Create a new worktree for this branch (via wt switch --create)
+  --dir <path>       Use an existing worktree directory
+  --tab <name>       Name for the new zellij tab (required)
+  --prompt <text>    Initial prompt to send to Claude
+  --resume           Resume the most recent Claude conversation in the worktree
+  -h, --help         Show this help
+USAGE
+}
+
+branch=""
+dir=""
+tab_name=""
+prompt=""
+resume=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --branch) branch="$2"; shift 2 ;;
+        --dir)    dir="$2"; shift 2 ;;
+        --tab)    tab_name="$2"; shift 2 ;;
+        --prompt) prompt="$2"; shift 2 ;;
+        --resume) resume=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+# --- Validation ---
+
+if [[ -z "${ZELLIJ:-}" ]]; then
+    echo "Error: not inside a zellij session" >&2
+    exit 1
+fi
+
+if [[ -z "$tab_name" ]]; then
+    echo "Error: --tab is required" >&2
+    exit 1
+fi
+
+if [[ -z "$branch" && -z "$dir" ]]; then
+    echo "Error: either --branch or --dir is required" >&2
+    exit 1
+fi
+
+# --- Resolve worktree path ---
+
+worktree_path=""
+
+if [[ -n "$branch" ]]; then
+    if ! git rev-parse --git-dir &>/dev/null; then
+        echo "Error: not inside a git repository" >&2
+        exit 1
+    fi
+
+    # Try to create a new branch + worktree.
+    if ! wt switch --create "$branch" --no-cd --yes 2>&1; then
+        # Branch already exists — check if it has a worktree.
+        worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
+            '.[] | select(.branch == $b) | .path')
+
+        if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+            # Branch exists but has no worktree — create one.
+            echo "Creating worktree for existing branch '$branch'..." >&2
+            wt switch "$branch" --no-cd --yes 2>&1
+        fi
+    fi
+
+    # Look up the worktree path (needed for both new and existing branches).
+    if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+        worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
+            '.[] | select(.branch == $b) | .path')
+    fi
+
+    if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+        echo "Error: could not find worktree path for branch '$branch'" >&2
+        echo "Check 'wt list' to see available worktrees." >&2
+        exit 1
+    fi
+else
+    worktree_path="$dir"
+    if [[ ! -d "$worktree_path" ]]; then
+        echo "Error: directory does not exist: $worktree_path" >&2
+        exit 1
+    fi
+fi
+
+# --- Build layout ---
+
+base_layout="$HOME/.config/zellij/layouts/claude-tab.kdl"
+layout_file=""
+
+if [[ "$resume" == true ]]; then
+    # Resume the most recent Claude conversation in this worktree.
+    layout_file="${TMPDIR:-/tmp}/zj-worktree-$(date +%s)-$$.kdl"
+    status_bar_pane=$(awk '/^layout \{/{next} /pane command=/{exit} {print}' "$base_layout")
+
+    cat > "$layout_file" <<LAYOUT
+layout {
+$status_bar_pane
+    pane command="zsh" size="80%" {
+        args "-lic" "claude --resume"
+    }
+    pane command="lazygit" size="20%"
+}
+LAYOUT
+elif [[ -n "$prompt" ]]; then
+    # Generate a layout with the prompt baked into claude's args.
+    # This avoids timing issues with zellij action write-chars.
+    # The status bar pane is extracted from the base layout so that changes
+    # to claude-tab.kdl (e.g. zjstatus config) are automatically picked up.
+    layout_file="${TMPDIR:-/tmp}/zj-worktree-$(date +%s)-$$.kdl"
+
+    # Extract the status bar pane block (everything before the first command pane).
+    status_bar_pane=$(awk '/^layout \{/{next} /pane command=/{exit} {print}' "$base_layout")
+
+    # Escape the prompt for embedding inside single quotes within a KDL string.
+    # Single quotes are escaped as '\'' (end quote, escaped quote, start quote).
+    # Double quotes and backslashes are escaped for the outer KDL string layer.
+    sq_escaped="${prompt//\'/\'\\\'\'}"
+    escaped="${sq_escaped//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+
+    cat > "$layout_file" <<LAYOUT
+layout {
+$status_bar_pane
+    pane command="zsh" size="80%" {
+        args "-lic" "claude --allowedTools='Edit,Write' '$escaped'"
+    }
+    pane command="lazygit" size="20%"
+}
+LAYOUT
+else
+    layout_file="$base_layout"
+fi
+
+# --- Open the tab ---
+
+zellij action new-tab --name "$tab_name" --cwd "$worktree_path" --layout "$layout_file"
+
+echo "Opened tab '$tab_name' in $worktree_path"
