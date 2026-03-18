@@ -89,8 +89,19 @@ elif [[ -n "$branch" ]]; then
         exit 1
     fi
 
+    # Fetch latest so new branches start from up-to-date origin/main.
+    default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+    default_branch="${default_branch:-main}"
+    base_flag=()
+    echo "◎ Fetching ${default_branch} from origin..." >&2
+    if git fetch origin "$default_branch" --quiet 2>&1; then
+        base_flag=(--base "origin/${default_branch}")
+    else
+        echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2
+    fi
+
     # Try to create a new branch + worktree.
-    if ! wt switch --create "$branch" --no-cd --yes 2>&1; then
+    if ! wt switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1; then
         # Branch already exists — check if it has a worktree.
         worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
             '.[] | select(.branch == $b) | .path')
