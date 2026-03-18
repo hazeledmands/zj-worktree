@@ -6,12 +6,14 @@ usage() {
 Usage:
   zj-worktree --branch <branch> --tab <name> [--prompt <text>]
   zj-worktree --branch <branch> --tab <name> --resume
+  zj-worktree --pr <number> --tab <name> [--prompt <text>]
   zj-worktree --dir <path> --tab <name> [--prompt <text>]
 
 Create a new zellij tab with Claude running in a git worktree.
 
 Options:
   --branch <branch>  Create a new worktree for this branch (via wt switch --create)
+  --pr <number>      Check out a PR's branch with remote tracking (via wt switch pr:<N>)
   --dir <path>       Use an existing worktree directory
   --tab <name>       Name for the new zellij tab (required)
   --prompt <text>    Initial prompt to send to Claude
@@ -21,6 +23,7 @@ USAGE
 }
 
 branch=""
+pr=""
 dir=""
 tab_name=""
 prompt=""
@@ -29,6 +32,7 @@ resume=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --branch) branch="$2"; shift 2 ;;
+        --pr)     pr="$2"; shift 2 ;;
         --dir)    dir="$2"; shift 2 ;;
         --tab)    tab_name="$2"; shift 2 ;;
         --prompt) prompt="$2"; shift 2 ;;
@@ -50,8 +54,8 @@ if [[ -z "$tab_name" ]]; then
     exit 1
 fi
 
-if [[ -z "$branch" && -z "$dir" ]]; then
-    echo "Error: either --branch or --dir is required" >&2
+if [[ -z "$branch" && -z "$pr" && -z "$dir" ]]; then
+    echo "Error: one of --branch, --pr, or --dir is required" >&2
     exit 1
 fi
 
@@ -59,7 +63,27 @@ fi
 
 worktree_path=""
 
-if [[ -n "$branch" ]]; then
+if [[ -n "$pr" ]]; then
+    # Check out a PR branch with remote tracking via wt switch pr:<N>.
+    if ! git rev-parse --git-dir &>/dev/null; then
+        echo "Error: not inside a git repository" >&2
+        exit 1
+    fi
+
+    wt switch "pr:${pr}" --no-cd --yes 2>&1
+
+    # Resolve the branch name from the PR so we can look up the worktree path.
+    branch=$(gh pr view "$pr" --json headRefName --jq '.headRefName')
+
+    worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
+        '.[] | select(.branch == $b) | .path')
+
+    if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+        echo "Error: could not find worktree path for PR #${pr} (branch '$branch')" >&2
+        echo "Check 'wt list' to see available worktrees." >&2
+        exit 1
+    fi
+elif [[ -n "$branch" ]]; then
     if ! git rev-parse --git-dir &>/dev/null; then
         echo "Error: not inside a git repository" >&2
         exit 1
