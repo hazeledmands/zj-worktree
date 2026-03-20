@@ -101,17 +101,25 @@ elif [[ -n "$branch" ]]; then
     fi
 
     # Try to create a new branch + worktree.
-    if ! wt switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1; then
-        # Branch already exists — check if it has a worktree.
+    create_output=$(wt switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1) || {
+        # If the branch already exists, fall through to reuse it.
+        # For unexpected errors, surface the output so it's not silently lost.
+        if ! echo "$create_output" | grep -qi "already exists"; then
+            echo "$create_output" >&2
+        fi
+
+        # Check if the branch already has a worktree.
         worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
             '.[] | select(.branch == $b) | .path')
 
         if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
             # Branch exists but has no worktree — create one.
-            echo "Creating worktree for existing branch '$branch'..." >&2
+            echo "◎ Creating worktree for existing branch '$branch'..." >&2
             wt switch "$branch" --no-cd --yes 2>&1
+        else
+            echo "◎ Using existing worktree for '$branch'" >&2
         fi
-    fi
+    }
 
     # Look up the worktree path (needed for both new and existing branches).
     if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
@@ -130,6 +138,12 @@ else
         echo "Error: directory does not exist: $worktree_path" >&2
         exit 1
     fi
+fi
+
+# --- Allow direnv if .envrc exists ---
+
+if [[ -f "$worktree_path/.envrc" ]] && command -v direnv &>/dev/null; then
+    direnv allow "$worktree_path" 2>/dev/null
 fi
 
 # --- Build layout ---
