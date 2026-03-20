@@ -140,11 +140,6 @@ else
     fi
 fi
 
-# --- Allow direnv if .envrc exists ---
-
-if [[ -f "$worktree_path/.envrc" ]] && command -v direnv &>/dev/null; then
-    direnv allow "$worktree_path" 2>/dev/null
-fi
 
 # --- Build layout ---
 
