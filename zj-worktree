@@ -181,7 +181,7 @@ elif [[ -n "$prompt" ]]; then
 layout {
 $status_bar_pane
     pane command="zsh" size="80%" {
-        args "-lic" "claude --allowedTools='Edit,Write' '$escaped'"
+        args "-lic" "claude '$escaped'"
     }
     pane command="lazygit" size="20%"
 }
