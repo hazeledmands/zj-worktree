@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: Dispatch work to a new worktree tab with its own Claude instance. Use when the user wants to send a task to a separate worktree or work on something in parallel. Triggers on "dispatch this", "work on this in a new tab", "create a worktree for this", "open a tab for", or when the user describes a task they want handled in a separate session.
-allowed-tools: Bash(zj-worktree:*), Bash(wt list:*), Bash(git branch:*), Bash(git log:*), Bash(gh pr view:*), Bash(git rev-parse:*), Bash(git worktree list:*), Bash(recall:*), Bash(basename:*), Bash(cat:*)
+allowed-tools: Bash(zj-worktree:*), Bash(wt list:*), Bash(git branch:*), Bash(git log:*), Bash(git fetch:*), Bash(gh pr view:*), Bash(git rev-parse:*), Bash(git worktree list:*), Bash(recall:*), Bash(basename:*), Bash(cat:*)
 ---
 
 # Dispatch to Worktree
@@ -33,7 +33,17 @@ git worktree list --porcelain | head -1 | sed 's/^worktree //'
 basename "$(git rev-parse --show-toplevel)"
 ```
 
-### 3. Pick a branch name
+### 3. Fetch latest main
+
+When starting a **new branch** (not resuming an existing one or checking out a PR branch), fetch and update the main branch so the worktree starts from the latest upstream state:
+
+```bash
+git fetch origin main:main
+```
+
+Skip this step when dispatching to an existing branch or PR — those already have their own history.
+
+### 4. Pick a branch name
 
 **When the task relates to an existing PR or branch**, use that branch rather than creating a new one. The worker needs to see the existing changes, and any resulting commits belong on that branch. For PRs, look up the `headRefName` to get the branch.
 
@@ -43,7 +53,7 @@ basename "$(git rev-parse --show-toplevel)"
 git branch --list '*/*' | tail -20
 ```
 
-### 4. Pick a tab name
+### 5. Pick a tab name
 
 Choose a short, descriptive name (1-2 words, enough to disambiguate from other tabs). The tab name should describe the **feature area or branch**, not the specific sub-task being performed. This keeps the tab name useful if the scope of work on that branch evolves.
 
@@ -55,7 +65,7 @@ Examples:
 - Branch `user/rebalancer/sync-metrics` → tab `sync-metrics` (not `fix-30456`)
 - Branch `user/ci/lint-migrations` → tab `lint-migrations`
 
-### 5. Choose: resume or new prompt
+### 6. Choose: resume or new prompt
 
 **Check for prior conversation history** — When dispatching to an existing branch, use `recall` to
 check whether there's a meaningful prior session to resume:
@@ -87,7 +97,7 @@ instead so the worker has the new context.
 - Be self-contained — the worker Claude won't have access to this conversation
 - Do NOT prescribe specific output mechanisms (e.g. "save to this file path"). Let the worker Claude use its own built-in tools for plans, summaries, etc. Just describe the desired outcome.
 
-### 6. Load per-repo dispatch instructions
+### 7. Load per-repo dispatch instructions
 
 Check for repo-specific dispatch instructions:
 
@@ -102,7 +112,7 @@ If the file exists, read and follow its contents. These instructions may specify
 
 If the file does not exist, skip this step entirely.
 
-### 7. Build worktree primer and dispatch
+### 8. Build worktree primer and dispatch
 
 **Append** a one-liner worktree context note to the end of the worker prompt:
 
@@ -122,7 +132,7 @@ For new work:
 zj-worktree --branch "<branch-name>" --tab "<tab-name>" --prompt "<worker-prompt>"
 ```
 
-### 8. Confirm
+### 9. Confirm
 
 Tell the user:
 - What branch was used
