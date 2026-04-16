@@ -144,51 +144,51 @@ fi
 # --- Build layout ---
 
 base_layout="$HOME/.config/zellij/layouts/claude-tab.kdl"
-layout_file=""
 
+# Create a temp directory for the layout file and ZDOTDIR.
+# The claude pane uses ZDOTDIR so it gets full shell init (direnv, asdf, etc.)
+# and drops to an interactive shell when claude exits.
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/zj-worktree-XXXXXX")
+
+# Set up ZDOTDIR: symlink real zsh dotfiles (except .zshrc, which we customize).
+for f in .zshenv .zprofile .zlogin .zlogout; do
+    [[ -f "$HOME/$f" ]] && ln -s "$HOME/$f" "$tmpdir/$f"
+done
+
+# Build the escaped claude command.
 if [[ "$resume" == true ]]; then
-    # Resume the most recent Claude conversation in this worktree.
-    layout_file="${TMPDIR:-/tmp}/zj-worktree-$(date +%s)-$$.kdl"
-    status_bar_pane=$(awk '/^layout \{/{next} /pane command=/{exit} {print}' "$base_layout")
-
-    cat > "$layout_file" <<LAYOUT
-layout {
-$status_bar_pane
-    pane command="zsh" size="80%" {
-        args "-lic" "claude --resume"
-    }
-    pane command="lazygit" size="20%"
-}
-LAYOUT
+    claude_cmd=$(printf '%q ' claude --resume)
 elif [[ -n "$prompt" ]]; then
-    # Generate a layout with the prompt baked into claude's args.
-    # This avoids timing issues with zellij action write-chars.
-    # The status bar pane is extracted from the base layout so that changes
-    # to claude-tab.kdl (e.g. zjstatus config) are automatically picked up.
-    layout_file="${TMPDIR:-/tmp}/zj-worktree-$(date +%s)-$$.kdl"
+    claude_cmd=$(printf '%q ' claude "$prompt")
+else
+    claude_cmd="claude"
+fi
 
-    # Extract the status bar pane block (everything before the first command pane).
-    status_bar_pane=$(awk '/^layout \{/{next} /pane command=/{exit} {print}' "$base_layout")
+# Write a .zshrc that sources the real one, loads direnv, runs claude,
+# then drops to an interactive shell. zshexit cleans up the temp dir.
+cat > "$tmpdir/.zshrc" <<ZSHRC
+source ~/.zshrc
+eval "\$(direnv export zsh)"
+$claude_cmd
+zshexit() { rm -rf "$tmpdir"; }
+ZSHRC
 
-    # Escape the prompt for embedding inside single quotes within a KDL string.
-    # Single quotes are escaped as '\'' (end quote, escaped quote, start quote).
-    # Double quotes and backslashes are escaped for the outer KDL string layer.
-    sq_escaped="${prompt//\'/\'\\\'\'}"
-    escaped="${sq_escaped//\\/\\\\}"
-    escaped="${escaped//\"/\\\"}"
+# Extract the status bar pane block from the base layout (everything before the
+# first command pane). This picks up status bar config changes automatically.
+status_bar_pane=$(awk '/^layout \{/{next} /pane command=/{exit} {print}' "$base_layout")
 
-    cat > "$layout_file" <<LAYOUT
+layout_file="$tmpdir/layout.kdl"
+cat > "$layout_file" <<LAYOUT
 layout {
 $status_bar_pane
     pane command="zsh" size="80%" {
-        args "-lic" "claude '$escaped'"
+        args "-c" "export ZDOTDIR='$tmpdir'; exec zsh -li"
     }
-    pane command="lazygit" size="20%"
+    pane command="zsh" size="20%" {
+        args "-lic" "eval \"\$(direnv export zsh)\"; exec lazygit"
+    }
 }
 LAYOUT
-else
-    layout_file="$base_layout"
-fi
 
 # --- Open the tab ---
 
