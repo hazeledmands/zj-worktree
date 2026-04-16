@@ -185,7 +185,7 @@ $status_bar_pane
         args "-c" "export ZDOTDIR='$tmpdir'; exec zsh -li"
     }
     pane command="zsh" size="20%" {
-        args "-lic" "eval \"\$(direnv export zsh)\"; exec lazygit"
+        args "-lic" "eval \"\$(direnv export zsh)\"; exec $HOME/.local/bin/prwatch"
     }
 }
 LAYOUT
