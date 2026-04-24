@@ -67,6 +67,8 @@ Skip this step entirely if the user has explicitly named a branch or PR to open 
 git branch --list '*/*' | tail -20
 ```
 
+**Stacked / nested PRs** — when the user wants the new branch to build on top of another branch rather than `origin/main` (e.g. "stack this on top of my feature branch", "this depends on the WIP refactor over in <branch>", "open a follow-up on top of PR #NNNN"), pass `--base <ref>` to zj-worktree. The ref is used verbatim — it can be a local branch, `origin/<branch>`, or any other git ref. Do NOT combine `--base` with `--pr` or `--dir`; it's only valid alongside `--branch`. If the user references a parent PR by number, look up its `headRefName` and use that as the base.
+
 ### 5. Pick a tab name
 
 Choose a short, descriptive name (1-2 words, enough to disambiguate from other tabs). The tab name should describe the **feature area or branch**, not the specific sub-task being performed. This keeps the tab name useful if the scope of work on that branch evolves.
@@ -183,3 +185,11 @@ User: "Open a tab for the connection-pool-refactor branch"
 1. **Branch**: `feature/connection-pool-refactor` (existing)
 2. **Tab**: `connection-pool`
 3. **Command**: `zj-worktree --branch feature/connection-pool-refactor --tab "connection-pool" --resume`
+
+### Stacked / nested PR
+User: "Open a tab to add tests on top of my `feature/new-scheduler` branch"
+
+1. **Branch**: `user/scheduler/tests` (new, stacked on the existing feature branch)
+2. **Base**: `feature/new-scheduler` (so the new branch diverges from there, not origin/main)
+3. **Tab**: `scheduler-tests`
+4. **Command**: `zj-worktree --branch user/scheduler/tests --base feature/new-scheduler --tab "scheduler-tests" --prompt "<prompt>"`

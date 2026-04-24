@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Usage:
-  zj-worktree --branch <branch> --tab <name> [--prompt <text>]
+  zj-worktree --branch <branch> --tab <name> [--base <ref>] [--prompt <text>]
   zj-worktree --branch <branch> --tab <name> --resume
   zj-worktree --pr <number> --tab <name> [--prompt <text>]
   zj-worktree --dir <path> --tab <name> [--prompt <text>]
@@ -15,6 +15,8 @@ Options:
   --branch <branch>  Create a new worktree for this branch (via wt switch --create)
   --pr <number>      Check out a PR's branch with remote tracking (via wt switch pr:<N>)
   --dir <path>       Use an existing worktree directory
+  --base <ref>       Base ref for new branch (default: origin/<default-branch>).
+                     Use this for stacked/nested PRs. Only valid with --branch.
   --tab <name>       Name for the new zellij tab (required)
   --prompt <text>    Initial prompt to send to Claude
   --resume           Resume the most recent Claude conversation in the worktree
@@ -25,6 +27,7 @@ USAGE
 branch=""
 pr=""
 dir=""
+base=""
 tab_name=""
 prompt=""
 resume=false
@@ -34,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --branch) branch="$2"; shift 2 ;;
         --pr)     pr="$2"; shift 2 ;;
         --dir)    dir="$2"; shift 2 ;;
+        --base)   base="$2"; shift 2 ;;
         --tab)    tab_name="$2"; shift 2 ;;
         --prompt) prompt="$2"; shift 2 ;;
         --resume) resume=true; shift ;;
@@ -59,6 +63,11 @@ if [[ -z "$branch" && -z "$pr" && -z "$dir" ]]; then
     exit 1
 fi
 
+if [[ -n "$base" && -z "$branch" ]]; then
+    echo "Error: --base is only valid with --branch" >&2
+    exit 1
+fi
+
 # --- Resolve worktree path ---
 
 worktree_path=""
@@ -70,7 +79,11 @@ if [[ -n "$pr" ]]; then
         exit 1
     fi
 
-    wt switch "pr:${pr}" --no-cd --yes 2>&1
+    # Run wt from the main worktree so project hooks resolve correctly even
+    # when zj-worktree is invoked from inside a secondary worktree.
+    main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+
+    wt -C "$main_repo" switch "pr:${pr}" --no-cd --yes 2>&1
 
     # Resolve the branch name from the PR so we can look up the worktree path.
     branch=$(gh pr view "$pr" --json headRefName --jq '.headRefName')
@@ -89,19 +102,29 @@ elif [[ -n "$branch" ]]; then
         exit 1
     fi
 
-    # Fetch latest so new branches start from up-to-date origin/main.
-    default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
-    default_branch="${default_branch:-main}"
+    # Run wt from the main worktree so project hooks resolve correctly even
+    # when zj-worktree is invoked from inside a secondary worktree.
+    main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+
     base_flag=()
-    echo "◎ Fetching ${default_branch} from origin..." >&2
-    if git fetch origin "$default_branch" --quiet 2>&1; then
-        base_flag=(--base "origin/${default_branch}")
+    if [[ -n "$base" ]]; then
+        # Caller supplied an explicit base (e.g. for stacked PRs). Pass it
+        # through without touching origin — it may be a local ref.
+        base_flag=(--base "$base")
     else
-        echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2
+        # Fetch latest so new branches start from up-to-date origin/main.
+        default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+        default_branch="${default_branch:-main}"
+        echo "◎ Fetching ${default_branch} from origin..." >&2
+        if git fetch origin "$default_branch" --quiet 2>&1; then
+            base_flag=(--base "origin/${default_branch}")
+        else
+            echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2
+        fi
     fi
 
     # Try to create a new branch + worktree.
-    create_output=$(wt switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1) || {
+    create_output=$(wt -C "$main_repo" switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1) || {
         # If the branch already exists, fall through to reuse it.
         # For unexpected errors, surface the output so it's not silently lost.
         if ! echo "$create_output" | grep -qi "already exists"; then
@@ -115,7 +138,7 @@ elif [[ -n "$branch" ]]; then
         if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
             # Branch exists but has no worktree — create one.
             echo "◎ Creating worktree for existing branch '$branch'..." >&2
-            wt switch "$branch" --no-cd --yes 2>&1
+            wt -C "$main_repo" switch "$branch" --no-cd --yes 2>&1
         else
             echo "◎ Using existing worktree for '$branch'" >&2
         fi
