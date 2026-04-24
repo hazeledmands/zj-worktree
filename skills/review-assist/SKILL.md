@@ -1,7 +1,7 @@
 ---
 name: review-assist
 description: Assists with reviewing GitHub PRs — opens files, summarizes changes, fetches threaded review comments, checks CI. Use when reviewing a PR, re-reviewing after updates, or needing to see discussion history on a PR. Triggers on PR numbers, GitHub PR URLs, or phrases like "review this PR", "look at PR 1234", "what's the status of this PR", "re-review", "check the comments on". Takes a PR number or URL as an argument.
-allowed-tools: Bash(python3 ~/.claude/skills/review-assist/pr-comments.py:*), Bash(gh pr view:*), Bash(gh pr diff:*), Bash(gh pr checks:*), Bash(zed:*)
+allowed-tools: Bash(python3 ~/.claude/skills/review-assist/pr-comments.py:*), Bash(gh pr view:*), Bash(gh pr diff:*), Bash(gh pr checks:*), Bash(code:*)
 ---
 
 # PR Review Assistant
@@ -10,10 +10,10 @@ When invoked with a PR number or URL (e.g. `/review-assist 31225` or `/review-as
 
 If this is a **re-review** (the user mentions "re-review", "changes since last review", or similar), look up the user's last review timestamp with `gh pr view <number> --json reviews` and pass `--since <timestamp>` to the comments script to filter to only new discussion.
 
-## 1. Open changed files in Zed
+## 1. Open changed files in VS Code
 
 ```bash
-zed . $(gh pr view <number> --json files --jq '.files[].path')
+code . $(gh pr view <number> --json files --jq '.files[].path')
 ```
 
 ## 2. Orient the user to the conversation so far

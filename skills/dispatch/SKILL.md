@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: Dispatch work to a new worktree tab with its own Claude instance. Use when the user wants to send a task to a separate worktree or work on something in parallel. Triggers on "dispatch this", "work on this in a new tab", "create a worktree for this", "open a tab for", or when the user describes a task they want handled in a separate session.
-allowed-tools: Bash(zj-worktree:*), Bash(wt list:*), Bash(git branch:*), Bash(git log:*), Bash(gh pr view:*), Bash(git rev-parse:*), Bash(git worktree list:*), Bash(recall:*), Bash(basename:*), Bash(cat:*)
+allowed-tools: Bash(zj-worktree:*), Bash(wt list:*), Bash(git branch:*), Bash(git log:*), Bash(gh pr view:*), Bash(git rev-parse:*), Bash(git worktree list:*), Bash(recall:*), Bash(basename:*), Bash(cat:*), Bash(ls:*), Bash(grep:*), Bash(rg:*), Read, Edit
 ---
 
 # Dispatch to Worktree
@@ -33,7 +33,31 @@ git worktree list --porcelain | head -1 | sed 's/^worktree //'
 basename "$(git rev-parse --show-toplevel)"
 ```
 
-### 3. Pick a branch name
+### 3. Check the archive for a matching entry
+
+Tabs that were put down with `/archive` live at `~/.claude/archive/` — each entry is a markdown file with frontmatter (tab, branch, repo, archived date) and a 1–3 sentence summary. `INDEX.md` lists the 20 most recent archives; older entries stay on disk but aren't indexed.
+
+Before committing to a branch name and starting fresh, see whether the user's task matches something already archived:
+
+```bash
+# Cheap path: scan the index.
+cat ~/.claude/archive/INDEX.md 2>/dev/null
+
+# If the task clearly relates to a specific topic not in the index, grep the full dir.
+grep -l -i "<keyword>" ~/.claude/archive/*.md 2>/dev/null
+```
+
+If you find a plausible match (same repo + overlapping topic), surface it to the user before dispatching:
+
+> I found an archived tab from 2026-04-18: **deletion-check** (branch `hazel/hound-deletion-check/fix`) — "Found the race in foo.go:42, next step is to add a mutex." Resume that instead of starting fresh?
+
+- If the user says resume: use the archived entry's **branch** and **tab** (don't invent new ones), dispatch with `--resume`, and **delete the archive file** (`rm ~/.claude/archive/<file>.md`) plus remove its line from `INDEX.md`. The tab is no longer archived.
+- If the user says start fresh: proceed normally; leave the archive entry alone.
+- If no plausible match: proceed normally.
+
+Skip this step entirely if the user has explicitly named a branch or PR to open — they already know what they want.
+
+### 4. Pick a branch name
 
 **When the task relates to an existing PR or branch**, use that branch rather than creating a new one. The worker needs to see the existing changes, and any resulting commits belong on that branch. For PRs, look up the `headRefName` to get the branch.
 
@@ -43,7 +67,7 @@ basename "$(git rev-parse --show-toplevel)"
 git branch --list '*/*' | tail -20
 ```
 
-### 4. Pick a tab name
+### 5. Pick a tab name
 
 Choose a short, descriptive name (1-2 words, enough to disambiguate from other tabs). The tab name should describe the **feature area or branch**, not the specific sub-task being performed. This keeps the tab name useful if the scope of work on that branch evolves.
 
@@ -55,7 +79,7 @@ Examples:
 - Branch `user/rebalancer/sync-metrics` → tab `sync-metrics` (not `fix-30456`)
 - Branch `user/ci/lint-migrations` → tab `lint-migrations`
 
-### 5. Choose: resume or new prompt
+### 6. Choose: resume or new prompt
 
 **Check for prior conversation history** — When dispatching to an existing branch, use `recall` to
 check whether there's a meaningful prior session to resume:
@@ -87,7 +111,7 @@ instead so the worker has the new context.
 - Be self-contained — the worker Claude won't have access to this conversation
 - Do NOT prescribe specific output mechanisms (e.g. "save to this file path"). Let the worker Claude use its own built-in tools for plans, summaries, etc. Just describe the desired outcome.
 
-### 6. Load per-repo dispatch instructions
+### 7. Load per-repo dispatch instructions
 
 Check for repo-specific dispatch instructions:
 
@@ -102,7 +126,7 @@ If the file exists, read and follow its contents. These instructions may specify
 
 If the file does not exist, skip this step entirely.
 
-### 7. Build worktree primer and dispatch
+### 8. Build worktree primer and dispatch
 
 **Append** a one-liner worktree context note to the end of the worker prompt:
 
@@ -122,7 +146,7 @@ For new work:
 zj-worktree --branch "<branch-name>" --tab "<tab-name>" --prompt "<worker-prompt>"
 ```
 
-### 8. Confirm
+### 9. Confirm
 
 Tell the user:
 - What branch was used
