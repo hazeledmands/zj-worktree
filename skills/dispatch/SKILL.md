@@ -18,7 +18,7 @@ Send a task to a new git worktree in a dedicated zellij tab with its own Claude 
 
 If the user provided a task description (as an argument or in conversation), use it directly. Otherwise, ask what they want done.
 
-**Don't pre-fetch URLs.** If the user pastes a Slack link, GitHub URL, or other reference, do NOT follow it yourself to gather context. Just include the URL in the worker prompt and let the dispatched agent fetch it. This avoids the temptation to "just quickly check" something and then end up doing the work yourself instead of dispatching.
+**Don't be overly prescriptive in your instructions for the dispatched agent.** Provide the context you already have plus the user's specific dispatch prompt, and let the worker figure out the rest. Fetching a referenced URL yourself first is fine — and often helps you pick a better branch/tab name — but don't escalate to actually doing the work; hand it off once you have enough context to dispatch sensibly.
 
 ### 2. Determine the repo context
 
@@ -32,6 +32,16 @@ git worktree list --porcelain | head -1 | sed 's/^worktree //'
 ```bash
 basename "$(git rev-parse --show-toplevel)"
 ```
+
+**Always determine the target repo's main checkout explicitly and pass it via `--repo` in step 8.** Do NOT rely on the shell's current working directory — your cwd can drift between tool calls (e.g. after a `git -C /other/repo …` or `cd` earlier in the session), and zj-worktree silently targets whatever repo cwd happens to be in, creating a stray branch + worktree in the wrong repo. Always passing `--repo` eliminates this footgun.
+
+**To identify the target repo**, search prior sessions by topic *without* a cwd constraint and inspect each result's `cwd` field to see which repo it lived in:
+
+```bash
+recall search "<topic-keywords>" --limit 5 --context 1
+```
+
+If the matching session's cwd is under a worktree of repo X, use X's main checkout as `--repo`. For new work with no prior session, default to the repo the user is currently working in (the cwd at the start of the conversation), but still pass `--repo` explicitly. When in doubt, surface the repo + branch you've identified to the user before dispatching.
 
 ### 3. Check the archive for a matching entry
 
@@ -138,14 +148,21 @@ If the file does not exist, skip this step entirely.
 
 If per-repo dispatch instructions (step 6) specified additional primer content, append that too.
 
+**Always pass `--repo "<main-checkout>"`** with the target repo identified in step 2 — see that step for why this matters.
+
 For resuming existing work:
 ```bash
-zj-worktree --branch "<branch-name>" --tab "<tab-name>" --resume
+zj-worktree --repo "<main-checkout>" --branch "<branch-name>" --tab "<tab-name>" --resume
 ```
 
 For new work:
 ```bash
-zj-worktree --branch "<branch-name>" --tab "<tab-name>" --prompt "<worker-prompt>"
+zj-worktree --repo "<main-checkout>" --branch "<branch-name>" --tab "<tab-name>" --prompt "<worker-prompt>"
+```
+
+For PR reviews, `--pr <number>` replaces `--branch`:
+```bash
+zj-worktree --repo "<main-checkout>" --pr <number> --tab "review-<author>-<topic>" --prompt "<worker-prompt>"
 ```
 
 ### 9. Confirm
@@ -161,35 +178,50 @@ Tell the user:
 ### New work
 User: "Can you fix the flaky test in TestConnectionPool? It's timing out intermittently."
 
-1. **Branch**: `fix/flaky-connection-pool-test` (or whatever matches repo conventions)
-2. **Tab**: `connection-pool`
-3. **Prompt**: "The test TestConnectionPool is flaky — it times out intermittently. Investigate the test, identify the timing issue, and fix it."
-4. **Command**: `zj-worktree --branch fix/flaky-connection-pool-test --tab "connection-pool" --prompt "<prompt>"`
+1. **Repo**: `/Users/hazel/Projects/<repo>` (the target repo's main checkout — always pass this)
+2. **Branch**: `fix/flaky-connection-pool-test` (or whatever matches repo conventions)
+3. **Tab**: `connection-pool`
+4. **Prompt**: "The test TestConnectionPool is flaky — it times out intermittently. Investigate the test, identify the timing issue, and fix it."
+5. **Command**: `zj-worktree --repo /Users/hazel/Projects/<repo> --branch fix/flaky-connection-pool-test --tab "connection-pool" --prompt "<prompt>"`
 
 ### Reviewing a PR
 When the user wants to review a PR authored by someone else, the default is an **interactive reading session** — the worker summarizes the PR and waits for questions. Do NOT have the worker perform a full code review unless the user explicitly asks for one.
 
 Use `--pr <number>` instead of `--branch` so the worktree tracks the remote branch (important for seeing the actual PR changes, not just an empty branch off main).
 
+**Tab name for PR reviews**: prefix with `review-<author>-` followed by a short topic, e.g. `review-ianwilkes-kafka-proto`. The author + topic prefix makes it obvious at a glance that the tab is a review (not your own work) and whose PR it is.
+
 The worker prompt should instruct the agent to run `/review-assist` for the given PR number, then wait for the user's questions.
 
 User: "I'd like to review PR 42"
 
-1. **Tab**: derive from PR title/topic
-2. **Prompt**: "The user wants to review PR #42. Run /review-assist 42 to get oriented, then wait for the user's questions."
-3. **Command**: `zj-worktree --pr 42 --tab "<topic>" --prompt "<prompt>"`
+1. **Repo**: `/Users/hazel/Projects/<repo>` (whichever repo PR 42 lives in)
+2. **Tab**: `review-<author>-<topic>` derived from the PR's author login and title (e.g. `review-ianwilkes-kafka-proto`)
+3. **Prompt**: "The user wants to review PR #42. Run /review-assist 42 to get oriented, then wait for the user's questions."
+4. **Command**: `zj-worktree --repo /Users/hazel/Projects/<repo> --pr 42 --tab "review-<author>-<topic>" --prompt "<prompt>"`
 
 ### Resuming existing work
 User: "Open a tab for the connection-pool-refactor branch"
 
-1. **Branch**: `feature/connection-pool-refactor` (existing)
-2. **Tab**: `connection-pool`
-3. **Command**: `zj-worktree --branch feature/connection-pool-refactor --tab "connection-pool" --resume`
+1. **Repo**: identify the target repo's main checkout via `recall search` (see step 2)
+2. **Branch**: `feature/connection-pool-refactor` (existing)
+3. **Tab**: `connection-pool`
+4. **Command**: `zj-worktree --repo /Users/hazel/Projects/<repo> --branch feature/connection-pool-refactor --tab "connection-pool" --resume`
+
+### Resuming work in a different repo than the caller's cwd
+User (cwd is in repo A): "Can you re-open the work I was doing on the scheduler cron?"
+
+1. Run `recall search "scheduler cron" --limit 5 --context 1`. The top hit's `cwd` is `/Users/hazel/Projects/infra.hazel-scheduler-cron-change`, which is a worktree of the `infra` repo — not repo A.
+2. **Repo**: `/Users/hazel/Projects/infra` (the main checkout for that worktree)
+3. **Branch**: `hazel/scheduler/cron-change` (derived from the worktree path)
+4. **Tab**: `scheduler-cron`
+5. **Command**: `zj-worktree --repo /Users/hazel/Projects/infra --branch hazel/scheduler/cron-change --tab "scheduler-cron" --resume`
 
 ### Stacked / nested PR
 User: "Open a tab to add tests on top of my `feature/new-scheduler` branch"
 
-1. **Branch**: `user/scheduler/tests` (new, stacked on the existing feature branch)
-2. **Base**: `feature/new-scheduler` (so the new branch diverges from there, not origin/main)
-3. **Tab**: `scheduler-tests`
-4. **Command**: `zj-worktree --branch user/scheduler/tests --base feature/new-scheduler --tab "scheduler-tests" --prompt "<prompt>"`
+1. **Repo**: `/Users/hazel/Projects/<repo>`
+2. **Branch**: `user/scheduler/tests` (new, stacked on the existing feature branch)
+3. **Base**: `feature/new-scheduler` (so the new branch diverges from there, not origin/main)
+4. **Tab**: `scheduler-tests`
+5. **Command**: `zj-worktree --repo /Users/hazel/Projects/<repo> --branch user/scheduler/tests --base feature/new-scheduler --tab "scheduler-tests" --prompt "<prompt>"`

@@ -82,6 +82,32 @@ else
     fail "--dir with nonexistent directory is rejected (got: $out)"
 fi
 
+# --repo with --dir should fail
+out=$(ZELLIJ=1 "$SCRIPT" --repo /tmp --dir /tmp --tab bar 2>&1) || true
+if echo "$out" | grep -q "Error: --repo and --dir are mutually exclusive"; then
+    pass "--repo with --dir is rejected"
+else
+    fail "--repo with --dir is rejected (got: $out)"
+fi
+
+# --repo with nonexistent path should fail
+out=$(ZELLIJ=1 "$SCRIPT" --repo /tmp/nonexistent-zj-worktree-test --branch foo --tab bar 2>&1) || true
+if echo "$out" | grep -q "Error: --repo path does not exist"; then
+    pass "--repo with nonexistent path is rejected"
+else
+    fail "--repo with nonexistent path is rejected (got: $out)"
+fi
+
+# --repo pointing at a non-git directory should fail
+nongit_dir=$(mktemp -d)
+out=$(ZELLIJ=1 "$SCRIPT" --repo "$nongit_dir" --branch foo --tab bar 2>&1) || true
+rmdir "$nongit_dir"
+if echo "$out" | grep -q "Error: --repo is not a git repository"; then
+    pass "--repo with non-git directory is rejected"
+else
+    fail "--repo with non-git directory is rejected (got: $out)"
+fi
+
 echo ""
 if [[ "$failures" -eq 0 ]]; then
     echo "All $tests tests passed."

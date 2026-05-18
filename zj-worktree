@@ -4,9 +4,9 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Usage:
-  zj-worktree --branch <branch> --tab <name> [--base <ref>] [--prompt <text>]
+  zj-worktree --branch <branch> --tab <name> [--repo <path>] [--base <ref>] [--prompt <text>]
   zj-worktree --branch <branch> --tab <name> --resume
-  zj-worktree --pr <number> --tab <name> [--prompt <text>]
+  zj-worktree --pr <number> --tab <name> [--repo <path>] [--prompt <text>]
   zj-worktree --dir <path> --tab <name> [--prompt <text>]
 
 Create a new zellij tab with Claude running in a git worktree.
@@ -15,6 +15,9 @@ Options:
   --branch <branch>  Create a new worktree for this branch (via wt switch --create)
   --pr <number>      Check out a PR's branch with remote tracking (via wt switch pr:<N>)
   --dir <path>       Use an existing worktree directory
+  --repo <path>      Target repo for --branch / --pr (default: current cwd's repo).
+                     Use this when dispatching into a different repo than the caller's cwd.
+                     Mutually exclusive with --dir.
   --base <ref>       Base ref for new branch (default: origin/<default-branch>).
                      Use this for stacked/nested PRs. Only valid with --branch.
   --tab <name>       Name for the new zellij tab (required)
@@ -27,6 +30,7 @@ USAGE
 branch=""
 pr=""
 dir=""
+repo=""
 base=""
 tab_name=""
 prompt=""
@@ -37,6 +41,7 @@ while [[ $# -gt 0 ]]; do
         --branch) branch="$2"; shift 2 ;;
         --pr)     pr="$2"; shift 2 ;;
         --dir)    dir="$2"; shift 2 ;;
+        --repo)   repo="$2"; shift 2 ;;
         --base)   base="$2"; shift 2 ;;
         --tab)    tab_name="$2"; shift 2 ;;
         --prompt) prompt="$2"; shift 2 ;;
@@ -66,6 +71,25 @@ fi
 if [[ -n "$base" && -z "$branch" ]]; then
     echo "Error: --base is only valid with --branch" >&2
     exit 1
+fi
+
+if [[ -n "$repo" && -n "$dir" ]]; then
+    echo "Error: --repo and --dir are mutually exclusive" >&2
+    exit 1
+fi
+
+# Run git/wt operations against --repo instead of the caller's cwd when set.
+# Useful for dispatching into a repo different from the one the caller is in.
+if [[ -n "$repo" ]]; then
+    if [[ ! -d "$repo" ]]; then
+        echo "Error: --repo path does not exist: $repo" >&2
+        exit 1
+    fi
+    if ! git -C "$repo" rev-parse --git-dir &>/dev/null; then
+        echo "Error: --repo is not a git repository: $repo" >&2
+        exit 1
+    fi
+    cd "$repo"
 fi
 
 # --- Resolve worktree path ---
