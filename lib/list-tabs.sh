@@ -106,7 +106,13 @@ done
 {
     for f in "${entries[@]}"; do
         status="$(parse_field "$f" status)"
+        archived="$(parse_field "$f" archived)"
         last_updated="$(parse_field "$f" last_updated)"
+        # Legacy fallback: pre-migration entries had only `archived:`. Treat
+        # them as archived (their original meaning) so filters + sort work.
+        [[ -z "$status" && -n "$archived" ]] && status="archived"
+        [[ -z "$last_updated" && -n "$archived" ]] && last_updated="$archived"
+
         repo="$(parse_field "$f" repo)"
         branch="$(parse_field "$f" branch)"
         tab="$(parse_field "$f" tab)"

@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve the script's real directory so lib/ helpers work through symlinks.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+    link_target="$(readlink "$self")"
+    if [[ "$link_target" = /* ]]; then
+        self="$link_target"
+    else
+        self="$(dirname "$self")/$link_target"
+    fi
+done
+ROOT="$(cd "$(dirname "$self")" && pwd -P)"
+LIB="$ROOT/lib"
+
 usage() {
     cat <<'USAGE'
 Usage:
@@ -9,9 +22,14 @@ Usage:
   zj-worktree --pr <number> --tab <name> [--repo <path>] [--prompt <text>]
   zj-worktree --dir <path> --tab <name> [--prompt <text>]
 
-Create a new zellij tab with Claude running in a git worktree.
+Subcommands:
+  zj-worktree archive [--remove]                   Close current tab; write archive entry
+                                                   (reads summary body from stdin).
+  zj-worktree resume <keyword> [--no-dispatch]     Restore an archived tab matching <keyword>.
+  zj-worktree list [--status S] [--limit N] [--format tsv|human]
+                                                   Show active + archived tabs.
 
-Options:
+Create options:
   --branch <branch>  Create a new worktree for this branch (via wt switch --create)
   --pr <number>      Check out a PR's branch with remote tracking (via wt switch pr:<N>)
   --dir <path>       Use an existing worktree directory
@@ -27,205 +45,244 @@ Options:
 USAGE
 }
 
-branch=""
-pr=""
-dir=""
-repo=""
-base=""
-tab_name=""
-prompt=""
-resume=false
+# -----------------------------------------------------------------------------
+# Shared archive helpers
+# -----------------------------------------------------------------------------
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --branch) branch="$2"; shift 2 ;;
-        --pr)     pr="$2"; shift 2 ;;
-        --dir)    dir="$2"; shift 2 ;;
-        --repo)   repo="$2"; shift 2 ;;
-        --base)   base="$2"; shift 2 ;;
-        --tab)    tab_name="$2"; shift 2 ;;
-        --prompt) prompt="$2"; shift 2 ;;
-        --resume) resume=true; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
-    esac
-done
+archive_dir_path() { echo "${ARCHIVE_DIR:-$HOME/.claude/archive}"; }
 
-# --- Validation ---
+entry_path_for() {
+    # entry_path_for <repo> <branch>  →  prints absolute path of the per-tab .md.
+    local repo="$1" branch="$2" slug
+    slug="${branch//\//-}"
+    echo "$(archive_dir_path)/${repo}-${slug}.md"
+}
 
-if [[ -z "${ZELLIJ:-}" ]]; then
-    echo "Error: not inside a zellij session" >&2
-    exit 1
-fi
-
-if [[ -z "$tab_name" ]]; then
-    echo "Error: --tab is required" >&2
-    exit 1
-fi
-
-if [[ -z "$branch" && -z "$pr" && -z "$dir" ]]; then
-    echo "Error: one of --branch, --pr, or --dir is required" >&2
-    exit 1
-fi
-
-if [[ -n "$base" && -z "$branch" ]]; then
-    echo "Error: --base is only valid with --branch" >&2
-    exit 1
-fi
-
-if [[ -n "$repo" && -n "$dir" ]]; then
-    echo "Error: --repo and --dir are mutually exclusive" >&2
-    exit 1
-fi
-
-# Run git/wt operations against --repo instead of the caller's cwd when set.
-# Useful for dispatching into a repo different from the one the caller is in.
-if [[ -n "$repo" ]]; then
-    if [[ ! -d "$repo" ]]; then
-        echo "Error: --repo path does not exist: $repo" >&2
-        exit 1
+write_active_entry() {
+    # write_active_entry <repo> <branch> <worktree> <tab>
+    # Writes a per-tab .md with status=active. Preserves dispatched: from any
+    # existing entry, so a resume → re-dispatch keeps the original date.
+    local repo="$1" branch="$2" worktree="$3" tab="$4"
+    local today entry dispatched
+    today="$(date +%Y-%m-%d)"
+    entry="$(entry_path_for "$repo" "$branch")"
+    dispatched="$today"
+    if [[ -f "$entry" ]]; then
+        local prev
+        prev="$(sed -n 's/^dispatched: //p' "$entry" | head -1)"
+        [[ -n "$prev" ]] && dispatched="$prev"
     fi
-    if ! git -C "$repo" rev-parse --git-dir &>/dev/null; then
-        echo "Error: --repo is not a git repository: $repo" >&2
-        exit 1
+    mkdir -p "$(archive_dir_path)"
+    local body=""
+    if [[ -f "$entry" ]]; then
+        # Preserve existing body across a resume.
+        body="$(awk 'BEGIN{s=0} /^---$/{s++;next} s==2{print}' "$entry")"
     fi
-    cd "$repo"
-fi
+    [[ -z "$body" ]] && body="Just dispatched. No notes yet."
+    cat > "$entry" <<EOF
+---
+tab: $tab
+branch: $branch
+worktree: $worktree
+repo: $repo
+status: active
+dispatched: $dispatched
+last_updated: $today
+---
 
-# --- Resolve worktree path ---
+$body
+EOF
+    echo "$entry"
+}
 
-worktree_path=""
+# -----------------------------------------------------------------------------
+# cmd_create — original "open a tab in a worktree" flow
+# -----------------------------------------------------------------------------
 
-if [[ -n "$pr" ]]; then
-    # Check out a PR branch with remote tracking via wt switch pr:<N>.
-    if ! git rev-parse --git-dir &>/dev/null; then
-        echo "Error: not inside a git repository" >&2
-        exit 1
-    fi
+cmd_create() {
+    local branch="" pr="" dir="" repo="" base="" tab_name="" prompt=""
+    local resume=false
 
-    # Run wt from the main worktree so project hooks resolve correctly even
-    # when zj-worktree is invoked from inside a secondary worktree.
-    main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branch) branch="$2"; shift 2 ;;
+            --pr)     pr="$2"; shift 2 ;;
+            --dir)    dir="$2"; shift 2 ;;
+            --repo)   repo="$2"; shift 2 ;;
+            --base)   base="$2"; shift 2 ;;
+            --tab)    tab_name="$2"; shift 2 ;;
+            --prompt) prompt="$2"; shift 2 ;;
+            --resume) resume=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+        esac
+    done
 
-    wt -C "$main_repo" switch "pr:${pr}" --no-cd --yes 2>&1
+    # --- Validation ---
 
-    # Resolve the branch name from the PR so we can look up the worktree path.
-    branch=$(gh pr view "$pr" --json headRefName --jq '.headRefName')
-
-    worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
-        '.[] | select(.branch == $b) | .path')
-
-    if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
-        echo "Error: could not find worktree path for PR #${pr} (branch '$branch')" >&2
-        echo "Check 'wt list' to see available worktrees." >&2
-        exit 1
-    fi
-elif [[ -n "$branch" ]]; then
-    if ! git rev-parse --git-dir &>/dev/null; then
-        echo "Error: not inside a git repository" >&2
+    if [[ -z "${ZELLIJ:-}" ]]; then
+        echo "Error: not inside a zellij session" >&2
         exit 1
     fi
 
-    # Run wt from the main worktree so project hooks resolve correctly even
-    # when zj-worktree is invoked from inside a secondary worktree.
-    main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+    if [[ -z "$tab_name" ]]; then
+        echo "Error: --tab is required" >&2
+        exit 1
+    fi
 
-    base_flag=()
-    if [[ -n "$base" ]]; then
-        # Caller supplied an explicit base (e.g. for stacked PRs). Pass it
-        # through without touching origin — it may be a local ref.
-        base_flag=(--base "$base")
-    else
-        # Fetch latest so new branches start from up-to-date origin/main.
-        default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
-        default_branch="${default_branch:-main}"
-        echo "◎ Fetching ${default_branch} from origin..." >&2
-        if git fetch origin "$default_branch" --quiet 2>&1; then
-            base_flag=(--base "origin/${default_branch}")
-        else
-            echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2
+    if [[ -z "$branch" && -z "$pr" && -z "$dir" ]]; then
+        echo "Error: one of --branch, --pr, or --dir is required" >&2
+        exit 1
+    fi
+
+    if [[ -n "$base" && -z "$branch" ]]; then
+        echo "Error: --base is only valid with --branch" >&2
+        exit 1
+    fi
+
+    if [[ -n "$repo" && -n "$dir" ]]; then
+        echo "Error: --repo and --dir are mutually exclusive" >&2
+        exit 1
+    fi
+
+    # Run git/wt operations against --repo instead of the caller's cwd when set.
+    # Useful for dispatching into a repo different from the one the caller is in.
+    if [[ -n "$repo" ]]; then
+        if [[ ! -d "$repo" ]]; then
+            echo "Error: --repo path does not exist: $repo" >&2
+            exit 1
         fi
+        if ! git -C "$repo" rev-parse --git-dir &>/dev/null; then
+            echo "Error: --repo is not a git repository: $repo" >&2
+            exit 1
+        fi
+        cd "$repo"
     fi
 
-    # Try to create a new branch + worktree.
-    create_output=$(wt -C "$main_repo" switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1) || {
-        # If the branch already exists, fall through to reuse it.
-        # For unexpected errors, surface the output so it's not silently lost.
-        if ! echo "$create_output" | grep -qi "already exists"; then
-            echo "$create_output" >&2
-        fi
+    # --- Resolve worktree path ---
 
-        # Check if the branch already has a worktree.
+    local worktree_path=""
+    local main_repo=""
+
+    if [[ -n "$pr" ]]; then
+        if ! git rev-parse --git-dir &>/dev/null; then
+            echo "Error: not inside a git repository" >&2
+            exit 1
+        fi
+        main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+        wt -C "$main_repo" switch "pr:${pr}" --no-cd --yes 2>&1
+        branch=$(gh pr view "$pr" --json headRefName --jq '.headRefName')
         worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
             '.[] | select(.branch == $b) | .path')
+        if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+            echo "Error: could not find worktree path for PR #${pr} (branch '$branch')" >&2
+            echo "Check 'wt list' to see available worktrees." >&2
+            exit 1
+        fi
+    elif [[ -n "$branch" ]]; then
+        if ! git rev-parse --git-dir &>/dev/null; then
+            echo "Error: not inside a git repository" >&2
+            exit 1
+        fi
+        main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+
+        local base_flag=()
+        if [[ -n "$base" ]]; then
+            base_flag=(--base "$base")
+        else
+            local default_branch
+            default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+            default_branch="${default_branch:-main}"
+            echo "◎ Fetching ${default_branch} from origin..." >&2
+            if git fetch origin "$default_branch" --quiet 2>&1; then
+                base_flag=(--base "origin/${default_branch}")
+            else
+                echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2
+            fi
+        fi
+
+        local create_output
+        create_output=$(wt -C "$main_repo" switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1) || {
+            if ! echo "$create_output" | grep -qi "already exists"; then
+                echo "$create_output" >&2
+            fi
+            worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
+                '.[] | select(.branch == $b) | .path')
+            if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+                echo "◎ Creating worktree for existing branch '$branch'..." >&2
+                wt -C "$main_repo" switch "$branch" --no-cd --yes 2>&1
+            else
+                echo "◎ Using existing worktree for '$branch'" >&2
+            fi
+        }
 
         if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
-            # Branch exists but has no worktree — create one.
-            echo "◎ Creating worktree for existing branch '$branch'..." >&2
-            wt -C "$main_repo" switch "$branch" --no-cd --yes 2>&1
-        else
-            echo "◎ Using existing worktree for '$branch'" >&2
+            worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
+                '.[] | select(.branch == $b) | .path')
         fi
-    }
-
-    # Look up the worktree path (needed for both new and existing branches).
-    if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
-        worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
-            '.[] | select(.branch == $b) | .path')
+        if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
+            echo "Error: could not find worktree path for branch '$branch'" >&2
+            echo "Check 'wt list' to see available worktrees." >&2
+            exit 1
+        fi
+    else
+        worktree_path="$dir"
+        if [[ ! -d "$worktree_path" ]]; then
+            echo "Error: directory does not exist: $worktree_path" >&2
+            exit 1
+        fi
     fi
 
-    if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
-        echo "Error: could not find worktree path for branch '$branch'" >&2
-        echo "Check 'wt list' to see available worktrees." >&2
-        exit 1
+    # --- Write/refresh per-tab archive entry (when we have a branch + main_repo) ---
+    # --dir-only dispatches don't have a branch/repo identity, so skip.
+
+    local entry_path=""
+    if [[ -n "$branch" && -n "$main_repo" ]]; then
+        local repo_name
+        repo_name="$(basename "$main_repo")"
+        entry_path="$(write_active_entry "$repo_name" "$branch" "$worktree_path" "$tab_name")"
     fi
-else
-    worktree_path="$dir"
-    if [[ ! -d "$worktree_path" ]]; then
-        echo "Error: directory does not exist: $worktree_path" >&2
-        exit 1
+
+    # --- Augment prompt with checkpoint-on-idle primer ---
+    # Only applies when --prompt is set. --resume reuses the prior conversation
+    # (which already contains the primer from the original dispatch).
+    if [[ -n "$prompt" && -n "$entry_path" ]]; then
+        prompt="$prompt
+
+(Your archive entry: $entry_path. Before going idle on this tab, if you've made meaningful progress since your last checkpoint, update its body with a 1–3 sentence summary and bump 'last_updated:' to today.)"
     fi
-fi
 
+    # --- Build layout ---
 
-# --- Build layout ---
+    local base_layout="$HOME/.config/zellij/layouts/claude-tab.kdl"
+    local tmpdir
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/zj-worktree-XXXXXX")
 
-base_layout="$HOME/.config/zellij/layouts/claude-tab.kdl"
+    for f in .zshenv .zprofile .zlogin .zlogout; do
+        [[ -f "$HOME/$f" ]] && ln -s "$HOME/$f" "$tmpdir/$f"
+    done
 
-# Create a temp directory for the layout file and ZDOTDIR.
-# The claude pane uses ZDOTDIR so it gets full shell init (direnv, asdf, etc.)
-# and drops to an interactive shell when claude exits.
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/zj-worktree-XXXXXX")
+    local claude_cmd
+    if [[ "$resume" == true ]]; then
+        claude_cmd=$(printf '%q ' claude --resume)
+    elif [[ -n "$prompt" ]]; then
+        claude_cmd=$(printf '%q ' claude "$prompt")
+    else
+        claude_cmd="claude"
+    fi
 
-# Set up ZDOTDIR: symlink real zsh dotfiles (except .zshrc, which we customize).
-for f in .zshenv .zprofile .zlogin .zlogout; do
-    [[ -f "$HOME/$f" ]] && ln -s "$HOME/$f" "$tmpdir/$f"
-done
-
-# Build the escaped claude command.
-if [[ "$resume" == true ]]; then
-    claude_cmd=$(printf '%q ' claude --resume)
-elif [[ -n "$prompt" ]]; then
-    claude_cmd=$(printf '%q ' claude "$prompt")
-else
-    claude_cmd="claude"
-fi
-
-# Write a .zshrc that sources the real one, loads direnv, runs claude,
-# then drops to an interactive shell. zshexit cleans up the temp dir.
-cat > "$tmpdir/.zshrc" <<ZSHRC
+    cat > "$tmpdir/.zshrc" <<ZSHRC
 source ~/.zshrc
 eval "\$(direnv export zsh)"
 $claude_cmd
 zshexit() { rm -rf "$tmpdir"; }
 ZSHRC
 
-# Extract the status bar pane block from the base layout (everything before the
-# first command pane). This picks up status bar config changes automatically.
-status_bar_pane=$(awk '/^layout \{/{next} /pane command=/{exit} {print}' "$base_layout")
+    local status_bar_pane
+    status_bar_pane=$(awk '/^layout \{/{next} /pane command=/{exit} {print}' "$base_layout")
 
-layout_file="$tmpdir/layout.kdl"
-cat > "$layout_file" <<LAYOUT
+    local layout_file="$tmpdir/layout.kdl"
+    cat > "$layout_file" <<LAYOUT
 layout {
 $status_bar_pane
     pane command="zsh" size="80%" {
@@ -237,8 +294,276 @@ $status_bar_pane
 }
 LAYOUT
 
-# --- Open the tab ---
+    # --- Open the tab ---
 
-zellij action new-tab --name "$tab_name" --cwd "$worktree_path" --layout "$layout_file"
+    zellij action new-tab --name "$tab_name" --cwd "$worktree_path" --layout "$layout_file"
 
-echo "Opened tab '$tab_name' in $worktree_path"
+    echo "Opened tab '$tab_name' in $worktree_path"
+}
+
+# -----------------------------------------------------------------------------
+# cmd_archive — close current tab, write archive entry
+# -----------------------------------------------------------------------------
+
+cmd_archive() {
+    local remove=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remove) remove=1; shift ;;
+            -h|--help) echo "usage: zj-worktree archive [--remove]  (reads body from stdin)"; exit 0 ;;
+            *) echo "Error: unknown option for 'archive': $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if ! git rev-parse --git-dir &>/dev/null; then
+        echo "Error: not inside a git repository" >&2
+        exit 1
+    fi
+
+    local worktree main
+    worktree="$(git rev-parse --show-toplevel)"
+    main="$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')"
+    if [[ "$worktree" == "$main" ]]; then
+        echo "Error: 'archive' is meant to be run from a secondary worktree, not the main checkout." >&2
+        exit 1
+    fi
+
+    local branch repo today
+    branch="$(git branch --show-current)"
+    if [[ -z "$branch" ]]; then
+        echo "Error: detached HEAD; cannot determine branch for archive entry" >&2
+        exit 1
+    fi
+    repo="$(basename "$main")"
+    today="$(date +%Y-%m-%d)"
+
+    # Read the summary body from stdin.
+    local body
+    body="$(cat)"
+    if [[ -z "$body" ]]; then
+        echo "Error: archive needs a summary body on stdin (1–3 sentences)" >&2
+        exit 1
+    fi
+
+    # Resolve tab name + pane sketch via find-tab.sh. Fall back to branch name.
+    local tab_name="" pane_sketch=""
+    local find_out=""
+    if find_out="$("$LIB/find-tab.sh" "$worktree" 2>/dev/null)"; then
+        local first
+        first="$(echo "$find_out" | head -1)"
+        tab_name="$(echo "$first" | cut -f3)"
+        pane_sketch="$(echo "$find_out" | tail -n +2)"
+    fi
+    [[ -z "$tab_name" ]] && tab_name="$(basename "$branch")"
+
+    local full_body="$body"
+    if [[ -n "$pane_sketch" ]]; then
+        full_body+=$'\n\n**Tab state at archive:**\n'"$pane_sketch"
+    fi
+
+    # Preserve dispatched: from any prior entry.
+    local entry dispatched
+    entry="$(entry_path_for "$repo" "$branch")"
+    dispatched="$today"
+    if [[ -f "$entry" ]]; then
+        local prev
+        prev="$(sed -n 's/^dispatched: //p' "$entry" | head -1)"
+        [[ -n "$prev" ]] && dispatched="$prev"
+    fi
+    mkdir -p "$(archive_dir_path)"
+
+    cat > "$entry" <<EOF
+---
+tab: $tab_name
+branch: $branch
+worktree: $worktree
+repo: $repo
+status: archived
+dispatched: $dispatched
+last_updated: $today
+archived: $today
+---
+
+$full_body
+EOF
+
+    # Close the tab (with optional --remove of the worktree).
+    local close_args=()
+    (( remove )) && close_args+=(--remove)
+    close_args+=("$worktree")
+
+    local close_rc=0
+    "$LIB/close-tab.sh" "${close_args[@]}" || close_rc=$?
+
+    case "$close_rc" in
+        0) echo "Archived '$tab_name' ($branch). Entry: $entry" ;;
+        1) echo "Archive entry written; no tab hosted this worktree, so nothing to close. Entry: $entry" ;;
+        2) echo "Archive entry written; multiple tabs host this worktree — close manually. Entry: $entry" >&2; exit 2 ;;
+        3) echo "Archive entry written; zellij/jq unavailable, tab not closed. Entry: $entry" >&2 ;;
+        4) echo "Archive entry written; close-tab-by-id failed. Entry: $entry" >&2; exit 4 ;;
+        5) echo "Archive entry written; 'wt remove' failed and tab not closed. Entry: $entry" >&2; exit 5 ;;
+        *) echo "Archive entry written; close-tab.sh exited $close_rc. Entry: $entry" >&2; exit "$close_rc" ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# cmd_resume — find archived entry by keyword, restore the tab
+# -----------------------------------------------------------------------------
+
+flip_to_active() {
+    # flip_to_active <file>
+    # Flips status to active, bumps last_updated to today, drops `archived:`.
+    local file="$1"
+    local today tmp
+    today="$(date +%Y-%m-%d)"
+    tmp="$(mktemp)"
+    awk -v today="$today" '
+        BEGIN { state = 0 }
+        state == 0 && /^---$/ { state = 1; print; next }
+        state == 1 && /^---$/ { state = 2; print; next }
+        state == 1 && /^status:/       { print "status: active"; next }
+        state == 1 && /^last_updated:/ { print "last_updated: " today; next }
+        state == 1 && /^archived:/     { next }
+        { print }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
+cmd_resume() {
+    local keyword="" no_dispatch=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-dispatch) no_dispatch=1; shift ;;
+            -h|--help) echo "usage: zj-worktree resume <keyword> [--no-dispatch]"; exit 0 ;;
+            --*) echo "Error: unknown option for 'resume': $1" >&2; exit 1 ;;
+            *)
+                if [[ -z "$keyword" ]]; then
+                    keyword="$1"; shift
+                else
+                    echo "Error: too many positional arguments to 'resume'" >&2; exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$keyword" ]]; then
+        echo "Error: 'resume' requires a keyword. usage: zj-worktree resume <keyword>" >&2
+        exit 1
+    fi
+
+    local all
+    all="$("$LIB/list-tabs.sh")" || true
+
+    if [[ -z "$all" ]]; then
+        echo "no matching archive entry for '$keyword' (archive is empty)" >&2
+        exit 1
+    fi
+
+    local matches
+    matches="$(echo "$all" | grep -F -- "$keyword" || true)"
+    if [[ -z "$matches" ]]; then
+        echo "no matching archive entry for '$keyword'" >&2
+        exit 1
+    fi
+
+    local match_count
+    match_count="$(echo "$matches" | wc -l | tr -d ' ')"
+    if (( match_count > 1 )); then
+        echo "multiple archive entries match '$keyword':" >&2
+        echo "$matches" >&2
+        exit 2
+    fi
+
+    # Parse fields via awk — see cmd_list for the IFS-whitespace gotcha.
+    local status last_updated repo branch tab worktree hook
+    status="$(echo "$matches" | awk -F'\t' '{print $1}')"
+    last_updated="$(echo "$matches" | awk -F'\t' '{print $2}')"
+    repo="$(echo "$matches" | awk -F'\t' '{print $3}')"
+    branch="$(echo "$matches" | awk -F'\t' '{print $4}')"
+    tab="$(echo "$matches" | awk -F'\t' '{print $5}')"
+    worktree="$(echo "$matches" | awk -F'\t' '{print $6}')"
+    hook="$(echo "$matches" | awk -F'\t' '{print $7}')"
+
+    # Derive the main checkout path from the worktree path + repo name.
+    # Convention: <main-parent>/<repo-name>.<branch-slug>  →  <main-parent>/<repo-name>
+    local main
+    main="$(dirname "$worktree")/$repo"
+
+    if (( no_dispatch )); then
+        echo "would resume: repo=$main branch=$branch tab=$tab worktree=$worktree"
+        return 0
+    fi
+
+    if [[ ! -d "$main" ]]; then
+        echo "Error: main checkout not found at $main (derived from worktree=$worktree, repo=$repo)" >&2
+        exit 1
+    fi
+
+    # Flip the entry back to active before dispatching.
+    local entry
+    entry="$(entry_path_for "$repo" "$branch")"
+    [[ -f "$entry" ]] && flip_to_active "$entry"
+
+    # Hand off to cmd_create via the existing flag interface.
+    cmd_create --repo "$main" --branch "$branch" --tab "$tab" --resume
+}
+
+# -----------------------------------------------------------------------------
+# cmd_list — pretty-print the result of lib/list-tabs.sh
+# -----------------------------------------------------------------------------
+
+cmd_list() {
+    local status_filter="" limit="" format="human"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status) status_filter="$2"; shift 2 ;;
+            --limit)  limit="$2"; shift 2 ;;
+            --format) format="$2"; shift 2 ;;
+            -h|--help) echo "usage: zj-worktree list [--status active|archived] [--limit N] [--format tsv|human]"; exit 0 ;;
+            *) echo "Error: unknown option for 'list': $1" >&2; exit 1 ;;
+        esac
+    done
+
+    local args=()
+    [[ -n "$status_filter" ]] && args+=(--status "$status_filter")
+    [[ -n "$limit" ]] && args+=(--limit "$limit")
+
+    local tsv
+    tsv="$("$LIB/list-tabs.sh" "${args[@]}")"
+    if [[ -z "$tsv" ]]; then
+        return 0
+    fi
+
+    if [[ "$format" == "tsv" ]]; then
+        echo "$tsv"
+        return 0
+    fi
+
+    # Use awk for TSV parsing: bash's `read -d $'\t'` coalesces empty leading
+    # fields because tab counts as whitespace in IFS, which mangles legacy
+    # entries whose status field is blank.
+    echo "$tsv" | awk -F'\t' '
+        NF >= 7 {
+            printf "%s [%s] %s (%s, %s) — %s\n", $2, $1, $5, $3, $4, $7
+        }
+    '
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
+
+if [[ $# -eq 0 ]]; then
+    usage; exit 0
+fi
+
+# Subcommand if the first arg is a bare word (doesn't start with -).
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -*)        cmd_create "$@" ;;
+    archive)   shift; cmd_archive "$@" ;;
+    resume)    shift; cmd_resume "$@" ;;
+    list)      shift; cmd_list "$@" ;;
+    create)    shift; cmd_create "$@" ;;
+    *)         echo "Error: unknown subcommand: $1" >&2; usage >&2; exit 1 ;;
+esac
