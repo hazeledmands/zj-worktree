@@ -45,27 +45,44 @@ If the matching session's cwd is under a worktree of repo X, use X's main checko
 
 ### 3. Check the archive for a matching entry
 
-Tabs that were put down with `/archive` live at `~/.claude/archive/` — each entry is a markdown file with frontmatter (tab, branch, repo, archived date) and a 1–3 sentence summary. `INDEX.md` lists the 20 most recent archives; older entries stay on disk but aren't indexed.
+Tabs that were put down with `/archive` live at `~/.claude/archive/` as
+per-tab markdown files with frontmatter (`tab`, `branch`, `repo`, `status`,
+`dispatched`, `last_updated`, `archived`) and a 1–3 sentence body summary.
+`zj-worktree resume <keyword>` does substring-matching across the TSV view
+(tab name + branch + repo + body hook) and either resolves a unique match,
+exits with candidates, or reports no hits.
 
-Before committing to a branch name and starting fresh, see whether the user's task matches something already archived:
+Before committing to a branch name and starting fresh, see whether the user's
+task matches something already archived:
 
 ```bash
-# Cheap path: scan the index.
-cat ~/.claude/archive/INDEX.md 2>/dev/null
-
-# If the task clearly relates to a specific topic not in the index, grep the full dir.
-grep -l -i "<keyword>" ~/.claude/archive/*.md 2>/dev/null
+zj-worktree resume "<topic-keyword>" --no-dispatch
 ```
 
-If you find a plausible match (same repo + overlapping topic), surface it to the user before dispatching:
+- **Exit 0** with a `would resume: ...` line → unique match. Surface it to
+  the user before doing anything else:
 
-> I found an archived tab from 2026-04-18: **deletion-check** (branch `hazel/hound-deletion-check/fix`) — "Found the race in foo.go:42, next step is to add a mutex." Resume that instead of starting fresh?
+  > I found an archived tab: **deletion-check** (`hazel/hound-deletion-check/fix`)
+  > — "Found the race in foo.go:42, next step is to add a mutex." Resume that
+  > instead of starting fresh?
 
-- If the user says resume: use the archived entry's **branch** and **tab** (don't invent new ones), dispatch with `--resume`, and **delete the archive file** (`rm ~/.claude/archive/<file>.md`) plus remove its line from `INDEX.md`. The tab is no longer archived.
-- If the user says start fresh: proceed normally; leave the archive entry alone.
-- If no plausible match: proceed normally.
+  - If user says resume: run `zj-worktree resume "<keyword>"` (no `--no-dispatch`).
+    The CLI flips the entry's `status:` back to `active`, bumps `last_updated`,
+    and dispatches a tab via `--resume`.
+  - If user says start fresh: proceed normally; leave the archive entry alone.
 
-Skip this step entirely if the user has explicitly named a branch or PR to open — they already know what they want.
+- **Exit 2** with multiple candidates listed on stderr → ambiguous. Pick the
+  most likely match (or ask the user to disambiguate), then re-run with a
+  more specific keyword. Don't guess silently.
+
+- **Exit 1** with "no matching archive entry" → no match; proceed normally.
+
+If you'd rather browse first, `zj-worktree list [--status archived] [--limit
+N]` prints all entries sorted by `last_updated` descending — useful when the
+user's description is vague and a keyword search misses.
+
+Skip this step entirely if the user has explicitly named a branch or PR to
+open — they already know what they want.
 
 ### 4. Pick a branch name
 

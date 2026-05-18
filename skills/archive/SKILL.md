@@ -1,111 +1,118 @@
 ---
 name: archive
-description: Put down the current worktree tab for later. Writes a short summary entry to ~/.claude/archive/ and closes the zellij tab; the worktree and session history typically persist so /dispatch can resume it later, but the skill can also remove the worktree when the context is throwaway (review-only, exploration, merged branch). Use when the user says "archive this", "put this down", "park this tab", "I'm done with this for now", or otherwise wants to stop working on the current tab without losing context.
-allowed-tools: Bash(git branch:*), Bash(git worktree:*), Bash(git rev-parse:*), Bash(git status:*), Bash(basename:*), Bash(~/.claude/skills/archive/find-tab.sh:*), Bash(~/.claude/skills/archive/close-tab.sh:*), Bash(~/.claude/skills/archive/save-archive.sh:*), Bash(ls:*), Read
+description: Put down the current worktree tab for later. Writes a short summary entry under ~/.claude/archive/ and closes the zellij tab; the worktree and session history typically persist so /dispatch can resume it later, but the skill can also remove the worktree when the context is throwaway (review-only, exploration, merged branch). Use when the user says "archive this", "put this down", "park this tab", "I'm done with this for now", or otherwise wants to stop working on the current tab without losing context.
+allowed-tools: Bash(zj-worktree:*), Bash(git rev-parse:*), Bash(git branch:*), Bash(git status:*), Bash(git worktree:*), Bash(basename:*), Read
 ---
 
 # Archive a Worktree Tab
 
-Put down a zellij worktree tab for later. Writes a short entry under `~/.claude/archive/` (so future `/dispatch` invocations can find it) and then closes the tab. By default the git worktree and the Claude session history stay put — "unarchiving" is just `/dispatch` opening a new tab with `--resume`. For throwaway contexts (review-only, scratch exploration, merged branch) the skill will proactively offer to also remove the worktree; see *(Optional) Remove the worktree* below.
+Put down a zellij worktree tab for later. Writes a short entry under
+`~/.claude/archive/` (so future `/dispatch` invocations can find it via
+`zj-worktree resume`) and then closes the tab. By default the git worktree
+and the Claude session history stay put — "unarchiving" is just `/dispatch`
+opening a new tab with `--resume`. For throwaway contexts (review-only,
+scratch exploration, merged branch) the skill will proactively offer to also
+remove the worktree; see *Throwaway contexts* below.
 
-**This is a worker-side skill.** Run it from inside the tab you want to put down, not from the dispatcher.
-
-**Permissions gotcha:** the `find-tab.sh` / `close-tab.sh` / `save-archive.sh` invocations below are pre-approved literally. Do **not** embed `$(...)` command substitution in them — the permission matcher treats the nested command as unapproved and prompts. Instead, either rely on `$PWD` defaults, or run `git rev-parse --show-toplevel` / `git branch --show-current` / etc. as separate bash calls and paste the resulting string in as a literal argument when invoking the script.
+**This is a worker-side skill.** Run it from inside the tab you want to put
+down, not from the dispatcher.
 
 ## Preflight
 
-Before doing anything, confirm this is a worktree worth archiving.
+Confirm this is a worktree worth archiving.
 
 ```bash
 git rev-parse --show-toplevel
 ```
 
-If the current directory is the main checkout (no worktree suffix — matches `git worktree list --porcelain | head -1`), stop and tell the user: "`/archive` is meant to be run from inside a worker worktree, not the main checkout. Run it from the tab you want to put down."
+If the current directory is the main checkout (matches `git worktree list
+--porcelain | head -1`), stop and tell the user: "`/archive` is meant to be
+run from inside a worker worktree, not the main checkout. Run it from the tab
+you want to put down." (`zj-worktree archive` enforces this too, but failing
+loudly here is friendlier.)
 
-Also check whether there are uncommitted changes:
+Check whether there are uncommitted changes:
 
 ```bash
 git status --porcelain
 ```
 
-If there are, mention them to the user once as part of the archive confirmation — they stay in the worktree regardless, but it's worth surfacing so the user can choose to commit/stash first if they want.
+If there are, mention them in the archive confirmation — they stay in the
+worktree regardless, but it's worth surfacing so the user can choose to
+commit/stash first if they want.
 
-## Gather state
+## Compose the summary
 
-Collect the bits that go into the archive entry:
+Write 1–3 sentences from your own context. Cover:
 
-- **Branch**: `git branch --show-current`
-- **Worktree path**: `git rev-parse --show-toplevel`
-- **Repo**: `basename` of the main checkout (first entry of `git worktree list --porcelain`)
-- **Tab info + pane sketch**: run `~/.claude/skills/archive/find-tab.sh` with no argument (it defaults to `$PWD`, which is the worktree). First line is `<session>\t<tab_id>\t<tab_name>` — use the `<tab_name>` as the canonical tab name (beats deriving from the branch). Lines 2+ are markdown bullets, one per non-plugin pane, ready to paste into the archive body. Handle non-zero exit codes per the Close-the-tab section below.
-- **Date**: today, in `YYYY-MM-DD` format
-- **Summary**: 1–3 sentences, written by you from your own context. Cover:
-  - What was the task?
-  - What's been done / what's the current state?
-  - What's blocking or what's the next step if resumed?
+- What was the task?
+- What's been done / what's the current state?
+- What's blocking or what's the next step if resumed?
 
-The summary is the whole point of the archive — it's the only thing `/dispatch` sees without loading the full session. Make it concrete. Avoid filler like "working on X"; prefer "Found the race in `foo.go:42`, reproduced with `go test -run TestBar`; next step is to add a mutex around the cache read."
+The summary is the whole point of the archive — it's what `zj-worktree
+resume` matches against and what future-you reads to figure out whether to
+pick this thread back up. Make it concrete. Avoid filler like "working on X";
+prefer "Found the race in `foo.go:42`, reproduced with `go test -run TestBar`;
+next step is to add a mutex around the cache read."
 
-## Write the archive entry
+## Write the entry and close the tab
 
-Use `~/.claude/skills/archive/save-archive.sh`. It takes the frontmatter fields as positional arguments and reads the entry body from stdin. **All five positional args must be literal strings** — substitute the values you gathered in the previous step directly into the command, do not use `$(...)` command substitution:
+Pipe the summary into `zj-worktree archive`. The CLI fills in the rest of
+the entry (frontmatter, tab name from `find-tab.sh`, pane sketch), then closes
+the zellij tab hosting this worktree.
 
 ```bash
-~/.claude/skills/archive/save-archive.sh "deletion-check" "hazel/hound-deletion-check/fix" "/Users/hazel/Projects/hound.hazel-hound-deletion-check-fix" "hound" "2026-04-24" <<'BODY'
-<summary, 1–3 sentences — the first non-blank line becomes the INDEX hook>
-
-**Tab state at archive:**
-<pane-sketch lines from find-tab.sh, one bullet per line>
+zj-worktree archive <<'BODY'
+<your 1–3 sentence summary>
 BODY
 ```
 
-The script writes `~/.claude/archive/<repo>-<branch-slug>.md` (overwriting if it exists — that's how re-archiving bumps to the top), then prepends a hook line to `~/.claude/archive/INDEX.md`, dedupes any prior entry for the same `(repo, branch)`, and trims the index to 20 lines.
+The entry is written to `~/.claude/archive/<repo>-<branch-slug>.md` with
+`status: archived`. If a prior entry exists for the same branch (e.g. you
+archived this once, resumed, and are archiving again), it's overwritten —
+including its `dispatched:` date, which is preserved across the rewrite.
 
-Notes:
-- Omit the "Tab state at archive" section from the body if `find-tab.sh` produced no pane lines.
-- The first non-blank line of the body becomes the INDEX hook (truncated to ~140 chars), so lead with the most load-bearing sentence.
+## Throwaway contexts
 
-## (Optional) Remove the worktree
+Default behavior is to leave the worktree on disk so `/dispatch` can resume
+it. Skip that default — pass `--remove` to also discard the worktree — when
+the context strongly suggests there's nothing to come back to:
 
-Default behavior is to leave the worktree on disk so `/dispatch` can resume it. Skip that default — proactively offer to remove the worktree — when the context strongly suggests there's nothing to come back to:
+- Reviewing someone else's PR (their branch will get deleted upstream).
+- Throwaway exploration the user has indicated they're done with.
+- Branch already merged.
+- Direct user signal: "nothing to resume", "I'm done done", "throwaway",
+  "just remove it", "ditch the worktree".
 
-- Reviewing someone else's PR (the branch isn't yours; it'll likely be deleted on merge upstream).
-- Throwaway exploration / scratch work the user has indicated they're done with.
-- Branch already merged upstream.
-- Direct user signal: "nothing to resume", "I'm done done", "throwaway", "just remove it", "ditch the worktree".
+When the trigger is unambiguous **and** the worktree is clean, just go ahead
+— don't ask first. The archive entry is written before `wt remove` runs, so
+the summary survives even if the worktree directory disappears.
 
-When the trigger is unambiguous **and** the worktree is clean, just go ahead — don't ask first. The archive entry has already been written, so the writeup (including the "Tab state at archive" section) survives the removal. Only the worktree directory and the live Claude session history go away; `/dispatch` resume won't work after this, but the summary remains discoverable in `~/.claude/archive/INDEX.md`. Tell the user what you did in one line after — they can object if it was wrong, and `wt remove` is conservative enough (won't delete an unmerged branch) that the blast radius of a misfire is small.
-
-**Always recheck for uncommitted work before removing.** Preflight already ran `git status --porcelain`. If it returned anything (or has changed since), do *not* proceed silently — surface those changes verbatim and require an explicit user confirmation that they really want to discard them before invoking the remove path. Do not pass `--force` or any equivalent flag without that confirmation. The "just go ahead" path is conditioned on the worktree being clean.
-
-When you decide to remove, do *not* invoke `wt` directly. The remove step is folded into the *Close the tab* helper via its `--remove` flag — see below. That keeps the whole skill running through pre-approved scripts, with no separate `wt` permission needed.
-
-## Close the tab
-
-Use the helper `~/.claude/skills/archive/close-tab.sh`. Invoke it with no argument — it defaults to `$PWD` (the worktree). The helper looks up the tab via `find-tab.sh` (matching panes by cwd), verifies the match is unique, and closes by ID — so it will never close a tab that doesn't actually host the worktree you named.
-
-```bash
-~/.claude/skills/archive/close-tab.sh
-```
-
-If you decided to remove the worktree per the optional section above, pass `--remove`. The helper runs `wt remove` first (after `cd "$HOME"` so cwd stays valid), and only proceeds to close the tab on success. If `wt remove` fails (e.g. unmerged branch, dirty tree it doesn't accept), it bails with exit 5 and leaves the tab open so you can investigate. Doing the remove this way avoids needing a separate `wt` permission.
+**Always recheck for uncommitted work before passing `--remove`.** Preflight
+already ran `git status --porcelain`; if it returned anything, surface those
+changes verbatim and require an explicit user confirmation before passing
+`--remove`. `wt remove` is conservative (refuses to delete unmerged branches
+without a force flag), so misfires are contained — but losing uncommitted
+work is still a regression you can prevent by asking.
 
 ```bash
-~/.claude/skills/archive/close-tab.sh --remove
+zj-worktree archive --remove <<'BODY'
+<your 1–3 sentence summary>
+BODY
 ```
 
-Handle non-zero exits explicitly — do **not** fall back to bare `zellij action close-tab`, which closes whichever tab is focused regardless of identity:
+## Handling errors from `zj-worktree archive`
 
-- Exit 1 (no tab hosts this worktree): the archive entry is written, but the tab wasn't located. Tell the user and move on.
-- Exit 2 (multiple tabs host this worktree): stop and ask the user which one to close. The candidates are on stderr as `<session>\t<tab_id>\t<tab_name>`. Once picked, invoke `find-tab.sh` / `close-tab.sh` again in the narrowed scope, or ask the user to close the remaining tab manually.
-- Exit 3 (environment error — zellij/jq missing, no sessions): archive entry is written; tell the user and stop.
-- Exit 4 (close-tab-by-id itself failed): rare; report it to the user.
-- Exit 5 (`--remove` only — `wt remove` failed): the worktree was *not* removed and the tab was *not* closed. Surface the stderr from `wt` to the user and let them decide whether to retry without `--remove`, fix the underlying issue, or abandon the archive.
+The CLI writes the archive entry **first**, then tries to close the tab. So
+even if closing fails, the summary is safely on disk. Specific cases the CLI
+reports:
 
-This ends the skill — no confirmation message is needed since the tab is going away. The archive entry itself is the confirmation.
+- "no tab hosted this worktree" — fine, just say so. The entry is written.
+- "multiple tabs host this worktree" — exit 2. Ask the user which to close.
+- "wt remove failed" — exit 5 (only with `--remove`). Surface the stderr and
+  let the user decide whether to retry without `--remove`, fix the issue, or
+  abandon the archive.
+- Detached HEAD or no branch — the CLI refuses. Resolve and retry.
 
-## Failure modes
-
-- **Not in a worktree**: stop and tell the user (see Preflight).
-- **No branch (detached HEAD)**: ask the user what identifier to file it under, or abort.
-- **Tab lookup fails** (`find-tab.sh` exits non-zero): see the close-tab section above for per-exit-code behavior. Never fall back to bare `zellij action close-tab` — it closes whichever tab is focused, which may not be the one you meant.
+This ends the skill — the tab is going away. No closing confirmation needed
+beyond what the CLI prints.
