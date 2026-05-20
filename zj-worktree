@@ -206,7 +206,15 @@ cmd_create() {
             exit 1
         fi
         main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
-        wt -C "$main_repo" switch "pr:${pr}" --no-cd --yes 2>&1
+        # Capture so wt's output doesn't share our (possibly-closed) stdout.
+        # Rust binaries panic on EPIPE writes even with our PIPE trap.
+        local wt_out wt_rc=0
+        wt_out=$(wt -C "$main_repo" switch "pr:${pr}" --no-cd --yes 2>&1) || wt_rc=$?
+        if (( wt_rc != 0 )); then
+            echo "Error: wt switch pr:${pr} failed (exit $wt_rc):" >&2 || :
+            [[ -n "$wt_out" ]] && echo "$wt_out" >&2 || :
+            exit "$wt_rc"
+        fi
         branch=$(gh pr view "$pr" --json headRefName --jq '.headRefName')
         worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
             '.[] | select(.branch == $b) | .path')
@@ -230,10 +238,13 @@ cmd_create() {
             default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
             default_branch="${default_branch:-main}"
             progress "◎ Fetching ${default_branch} from origin..."
-            if git fetch origin "$default_branch" --quiet 2>&1; then
+            # Capture so any --quiet-bypassed writes don't share our stdout.
+            local fetch_out
+            if fetch_out=$(git fetch origin "$default_branch" --quiet 2>&1); then
                 base_flag=(--base "origin/${default_branch}")
             else
                 echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2 || :
+                [[ -n "$fetch_out" ]] && echo "$fetch_out" >&2 || :
             fi
         fi
 
@@ -246,7 +257,13 @@ cmd_create() {
                 '.[] | select(.branch == $b) | .path')
             if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
                 progress "◎ Creating worktree for existing branch '$branch'..."
-                wt -C "$main_repo" switch "$branch" --no-cd --yes 2>&1
+                local wt2_out wt2_rc=0
+                wt2_out=$(wt -C "$main_repo" switch "$branch" --no-cd --yes 2>&1) || wt2_rc=$?
+                if (( wt2_rc != 0 )); then
+                    echo "Error: wt switch '$branch' failed (exit $wt2_rc):" >&2 || :
+                    [[ -n "$wt2_out" ]] && echo "$wt2_out" >&2 || :
+                    exit "$wt2_rc"
+                fi
             else
                 progress "◎ Using existing worktree for '$branch'"
             fi
@@ -331,8 +348,20 @@ $status_bar_pane
 LAYOUT
 
     # --- Open the tab ---
-
-    zellij action new-tab --name "$tab_name" --cwd "$worktree_path" --layout "$layout_file"
+    #
+    # Capture zellij's output so it doesn't share our stdout. zellij is a
+    # Rust binary and panics on EPIPE writes (even though our shell ignores
+    # SIGPIPE), so when an agent harness closes our stdout pipe, a single
+    # status byte from zellij can kill the action mid-dispatch. By keeping
+    # zellij's stdout pointed at our capture pipe, the new-tab IPC request
+    # always completes regardless of what the agent harness does with ours.
+    local zellij_out zellij_rc=0
+    zellij_out=$(zellij action new-tab --name "$tab_name" --cwd "$worktree_path" --layout "$layout_file" 2>&1) || zellij_rc=$?
+    if (( zellij_rc != 0 )); then
+        echo "Error: zellij action new-tab failed (exit $zellij_rc):" >&2 || :
+        [[ -n "$zellij_out" ]] && echo "$zellij_out" >&2 || :
+        exit "$zellij_rc"
+    fi
 
     say "Opened tab '$tab_name' in $worktree_path"
 
