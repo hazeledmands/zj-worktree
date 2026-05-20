@@ -87,6 +87,19 @@ USAGE
 
 archive_dir_path() { echo "${ARCHIVE_DIR:-$HOME/.claude/archive}"; }
 
+git_main_repo() {
+    # Print the absolute path of the main checkout for the current cwd. The
+    # obvious form `git worktree list --porcelain | awk '/^worktree /{print $2;
+    # exit}'` is fragile: awk's early exit closes the pipe, git gets SIGPIPE on
+    # its next write, and dies with 141. Our `trap '' PIPE` only protects this
+    # shell — child processes inherit SIG_DFL — so under set -e -o pipefail the
+    # whole script dies before producing any user-facing output. Capture the
+    # porcelain list first, then parse it without a pipeline producer.
+    local wt_list
+    wt_list=$(git worktree list --porcelain)
+    awk '/^worktree /{print $2; exit}' <<<"$wt_list"
+}
+
 entry_path_for() {
     # entry_path_for <repo> <branch>  →  prints absolute path of the per-tab .md.
     local repo="$1" branch="$2" slug
@@ -105,7 +118,8 @@ write_active_entry() {
     dispatched="$today"
     if [[ -f "$entry" ]]; then
         local prev
-        prev="$(sed -n 's/^dispatched: //p' "$entry" | head -1)"
+        prev="$(sed -n 's/^dispatched: //p' "$entry")"
+        prev="${prev%%$'\n'*}"
         [[ -n "$prev" ]] && dispatched="$prev"
     fi
     mkdir -p "$(archive_dir_path)"
@@ -205,7 +219,7 @@ cmd_create() {
             echo "Error: not inside a git repository" >&2
             exit 1
         fi
-        main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+        main_repo=$(git_main_repo)
         # Capture so wt's output doesn't share our (possibly-closed) stdout.
         # Rust binaries panic on EPIPE writes even with our PIPE trap.
         local wt_out wt_rc=0
@@ -228,7 +242,7 @@ cmd_create() {
             echo "Error: not inside a git repository" >&2
             exit 1
         fi
-        main_repo=$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+        main_repo=$(git_main_repo)
 
         local base_flag=()
         if [[ -n "$base" ]]; then
@@ -250,7 +264,7 @@ cmd_create() {
 
         local create_output
         create_output=$(wt -C "$main_repo" switch --create "$branch" "${base_flag[@]}" --no-cd --yes 2>&1) || {
-            if ! echo "$create_output" | grep -qi "already exists"; then
+            if ! grep -qi "already exists" <<<"$create_output"; then
                 echo "$create_output" >&2
             fi
             worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
@@ -394,7 +408,7 @@ cmd_archive() {
 
     local worktree main
     worktree="$(git rev-parse --show-toplevel)"
-    main="$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')"
+    main="$(git_main_repo)"
     if [[ "$worktree" == "$main" ]]; then
         echo "Error: 'archive' is meant to be run from a secondary worktree, not the main checkout." >&2
         exit 1
@@ -422,9 +436,9 @@ cmd_archive() {
     local find_out=""
     if find_out="$("$LIB/find-tab.sh" "$worktree" 2>/dev/null)"; then
         local first
-        first="$(echo "$find_out" | head -1)"
-        tab_name="$(echo "$first" | cut -f3)"
-        pane_sketch="$(echo "$find_out" | tail -n +2)"
+        first="$(head -1 <<<"$find_out")"
+        tab_name="$(cut -f3 <<<"$first")"
+        pane_sketch="$(tail -n +2 <<<"$find_out")"
     fi
     [[ -z "$tab_name" ]] && tab_name="$(basename "$branch")"
 
@@ -439,7 +453,8 @@ cmd_archive() {
     dispatched="$today"
     if [[ -f "$entry" ]]; then
         local prev
-        prev="$(sed -n 's/^dispatched: //p' "$entry" | head -1)"
+        prev="$(sed -n 's/^dispatched: //p' "$entry")"
+        prev="${prev%%$'\n'*}"
         [[ -n "$prev" ]] && dispatched="$prev"
     fi
     mkdir -p "$(archive_dir_path)"
