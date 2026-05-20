@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ignore SIGPIPE: when an agent harness captures our output through a pipe and
+# closes it mid-stream, we don't want the signal to kill us before the work
+# (worktree create, tab open, archive flip) completes. With this trap, writes
+# to a closed pipe return EPIPE instead; helpers below mask that under set -e.
+trap '' PIPE
+
 # Resolve the script's real directory so lib/ helpers work through symlinks.
 self="${BASH_SOURCE[0]}"
 while [[ -L "$self" ]]; do
@@ -13,6 +19,36 @@ while [[ -L "$self" ]]; do
 done
 ROOT="$(cd "$(dirname "$self")" && pwd -P)"
 LIB="$ROOT/lib"
+
+# -----------------------------------------------------------------------------
+# Output helpers
+#
+# `progress` writes informational "◎ ..." lines to stderr — but only when
+# stderr is a TTY. In a pipe (agent harness), they'd be noise and would race
+# with the consumer closing the pipe, so we drop them entirely.
+#
+# `say` writes a finish line (e.g. "Opened tab '...'") to stdout, tolerating
+# a broken pipe so a consumer that closed early can't kill us after the work
+# already completed.
+#
+# `result` emits a stable, machine-parseable last-line contract. Agents can
+# grep `^result: ` to confirm the operation finished without parsing prose.
+# -----------------------------------------------------------------------------
+
+progress() {
+    [[ -t 2 ]] || return 0
+    printf '%s\n' "$*" >&2
+}
+
+say() {
+    printf '%s\n' "$*" || :
+}
+
+result() {
+    # Args are pre-formatted "key=value" pairs after the action name.
+    # Example: result created tab=foo worktree=/path
+    printf 'result: %s\n' "$*" || :
+}
 
 usage() {
     cat <<'USAGE'
@@ -193,11 +229,11 @@ cmd_create() {
             local default_branch
             default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
             default_branch="${default_branch:-main}"
-            echo "◎ Fetching ${default_branch} from origin..." >&2
+            progress "◎ Fetching ${default_branch} from origin..."
             if git fetch origin "$default_branch" --quiet 2>&1; then
                 base_flag=(--base "origin/${default_branch}")
             else
-                echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2
+                echo "⚠ Could not fetch from origin; branching from local ${default_branch}" >&2 || :
             fi
         fi
 
@@ -209,10 +245,10 @@ cmd_create() {
             worktree_path=$(wt list --format=json | jq -r --arg b "$branch" \
                 '.[] | select(.branch == $b) | .path')
             if [[ -z "$worktree_path" || "$worktree_path" == "null" ]]; then
-                echo "◎ Creating worktree for existing branch '$branch'..." >&2
+                progress "◎ Creating worktree for existing branch '$branch'..."
                 wt -C "$main_repo" switch "$branch" --no-cd --yes 2>&1
             else
-                echo "◎ Using existing worktree for '$branch'" >&2
+                progress "◎ Using existing worktree for '$branch'"
             fi
         }
 
@@ -298,7 +334,14 @@ LAYOUT
 
     zellij action new-tab --name "$tab_name" --cwd "$worktree_path" --layout "$layout_file"
 
-    echo "Opened tab '$tab_name' in $worktree_path"
+    say "Opened tab '$tab_name' in $worktree_path"
+
+    # Machine-readable result contract. Always last line on stdout for
+    # successful create; agents can grep `^result: created`.
+    local result_fields="created tab=$tab_name worktree=$worktree_path"
+    [[ -n "$branch" ]] && result_fields="$result_fields branch=$branch"
+    [[ -n "$entry_path" ]] && result_fields="$result_fields entry=$entry_path"
+    result "$result_fields"
 }
 
 # -----------------------------------------------------------------------------
@@ -396,14 +439,16 @@ EOF
     "$LIB/close-tab.sh" "${close_args[@]}" || close_rc=$?
 
     case "$close_rc" in
-        0) echo "Archived '$tab_name' ($branch). Entry: $entry" ;;
-        1) echo "Archive entry written; no tab hosted this worktree, so nothing to close. Entry: $entry" ;;
-        2) echo "Archive entry written; multiple tabs host this worktree — close manually. Entry: $entry" >&2; exit 2 ;;
-        3) echo "Archive entry written; zellij/jq unavailable, tab not closed. Entry: $entry" >&2 ;;
-        4) echo "Archive entry written; close-tab-by-id failed. Entry: $entry" >&2; exit 4 ;;
-        5) echo "Archive entry written; 'wt remove' failed and tab not closed. Entry: $entry" >&2; exit 5 ;;
-        *) echo "Archive entry written; close-tab.sh exited $close_rc. Entry: $entry" >&2; exit "$close_rc" ;;
+        0) say "Archived '$tab_name' ($branch). Entry: $entry" ;;
+        1) say "Archive entry written; no tab hosted this worktree, so nothing to close. Entry: $entry" ;;
+        2) echo "Archive entry written; multiple tabs host this worktree — close manually. Entry: $entry" >&2 || :; exit 2 ;;
+        3) echo "Archive entry written; zellij/jq unavailable, tab not closed. Entry: $entry" >&2 || : ;;
+        4) echo "Archive entry written; close-tab-by-id failed. Entry: $entry" >&2 || :; exit 4 ;;
+        5) echo "Archive entry written; 'wt remove' failed and tab not closed. Entry: $entry" >&2 || :; exit 5 ;;
+        *) echo "Archive entry written; close-tab.sh exited $close_rc. Entry: $entry" >&2 || :; exit "$close_rc" ;;
     esac
+
+    result "archived tab=$tab_name branch=$branch entry=$entry"
 }
 
 # -----------------------------------------------------------------------------
@@ -535,18 +580,23 @@ cmd_list() {
     fi
 
     if [[ "$format" == "tsv" ]]; then
-        echo "$tsv"
+        echo "$tsv" || :
         return 0
     fi
 
     # Use awk for TSV parsing: bash's `read -d $'\t'` coalesces empty leading
     # fields because tab counts as whitespace in IFS, which mangles legacy
     # entries whose status field is blank.
-    echo "$tsv" | awk -F'\t' '
+    #
+    # `2>/dev/null || true`: when a consumer pipes our output into `head -n`
+    # or similar and closes the read side mid-stream, awk's next write fails
+    # with EPIPE; suppress its "write error" complaint and don't let the
+    # non-zero exit propagate through set -o pipefail + set -e.
+    awk -F'\t' '
         NF >= 7 {
             printf "%s [%s] %s (%s, %s) — %s\n", $2, $1, $5, $3, $4, $7
         }
-    '
+    ' <<<"$tsv" 2>/dev/null || true
 }
 
 # -----------------------------------------------------------------------------

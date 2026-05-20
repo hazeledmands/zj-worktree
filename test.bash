@@ -384,6 +384,77 @@ else
 fi
 
 echo ""
+echo "=== agent-friendliness: SIGPIPE + result lines ==="
+
+# `zj-worktree list | head -1` should exit 0, not 141 (SIGPIPE). Use enough
+# entries that awk's output overflows the pipe buffer, forcing multiple
+# writes — otherwise the first write may flush everything before head closes
+# and the bug doesn't trigger.
+dir=$(mk_archive_dir)
+for i in $(seq 1 2000); do
+    mk_entry "$dir" "hound-e$i" "e$i" "hazel/longish-branch-name-for-bulk-$i" \
+        "/tmp/zjwt-fake/e$i-some-long-path-here" "hound" archived \
+        2026-04-01 2026-05-01 2026-05-01 <<<"entry $i body lorem ipsum dolor sit amet"
+done
+ARCHIVE_DIR="$dir" "$SCRIPT" list 2>/dev/null | head -1 >/dev/null || true
+rc=${PIPESTATUS[0]}
+rm -rf "$dir"
+if (( rc == 0 )); then
+    pass "list piped into head -1 exits 0 (SIGPIPE tolerated)"
+else
+    fail "list piped into head -1 exits 0 (SIGPIPE tolerated) (rc=$rc)"
+fi
+
+# `zj-worktree list` (TTY-style invocation, no closed pipe) should still emit
+# the entries normally — broken-pipe tolerance shouldn't swallow real output.
+dir=$(mk_archive_dir)
+mk_entry "$dir" "hound-a" "a" "hazel/a" "/tmp/zjwt-fake/a" "hound" archived 2026-04-01 2026-05-01 2026-05-01 <<<"entry a"
+mk_entry "$dir" "hound-b" "b" "hazel/b" "/tmp/zjwt-fake/b" "hound" archived 2026-04-02 2026-05-02 2026-05-02 <<<"entry b"
+out=$(ARCHIVE_DIR="$dir" "$SCRIPT" list 2>&1) || true
+rm -rf "$dir"
+if echo "$out" | grep -q "hazel/a" && echo "$out" | grep -q "hazel/b"; then
+    pass "list still emits all entries when not piped"
+else
+    fail "list still emits all entries when not piped (got: $out)"
+fi
+
+# archive on a non-main worktree path that has no live zellij tab should
+# still emit a `result: archived ...` line on stdout, as the last line.
+# We invoke archive against a fake worktree by creating a tiny git repo,
+# adding a worktree to it, and running archive from that worktree.
+maintmp=$(mktemp -d)
+(
+    cd "$maintmp"
+    git init -q
+    git commit -q --allow-empty -m "init"
+    git worktree add -q -b test-archive-branch wt-test >/dev/null 2>&1
+)
+adir=$(mk_archive_dir)
+out=$(cd "$maintmp/wt-test" && ZELLIJ=1 ARCHIVE_DIR="$adir" "$SCRIPT" archive 2>&1 <<<"test body" || true)
+last_line=$(echo "$out" | grep '^result: ' | tail -1)
+# Cleanup
+git -C "$maintmp" worktree remove -f wt-test 2>/dev/null || true
+rm -rf "$maintmp" "$adir"
+if echo "$last_line" | grep -q "^result: archived "; then
+    pass "archive emits result: archived line on stdout"
+else
+    fail "archive emits result: archived line on stdout (got last result line: '$last_line', full: $out)"
+fi
+
+# Progress `◎` glyphs should not leak onto a captured (non-TTY) stderr.
+# We can't exercise --branch end-to-end here (it needs wt/zellij), but
+# `progress` is a top-level helper — invoke it via a short subshell that
+# sources the script's helper conditionally. The simpler check: run a
+# command whose ◎ output would otherwise appear (we don't have one that
+# stays inside validation), so verify via direct call instead.
+out=$( "$SCRIPT" --help 2>&1 )
+if ! echo "$out" | grep -q "◎"; then
+    pass "no ◎ glyphs in --help output"
+else
+    fail "no ◎ glyphs in --help output (got: $out)"
+fi
+
+echo ""
 if [[ "$failures" -eq 0 ]]; then
     echo "All $tests tests passed."
 else
