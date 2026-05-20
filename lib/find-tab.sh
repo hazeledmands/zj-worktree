@@ -38,7 +38,12 @@ for cmd in zellij jq; do
   fi
 done
 
-sessions="$(zellij list-sessions --short --no-formatting 2>/dev/null || true)"
+# Drop `--short` so we can see (and filter out) EXITED sessions. Calling
+# `list-panes --json` against an EXITED session exits 0 but writes the active-
+# session listing (ANSI-coloured, non-JSON) to stdout, which then crashes jq
+# with "parse error: Invalid numeric literal" later in the loop.
+sessions_raw="$(zellij list-sessions --no-formatting 2>/dev/null || true)"
+sessions="$(awk '!/EXITED/ {print $1}' <<<"$sessions_raw")"
 if [[ -z "$sessions" ]]; then
   echo "find-tab: no zellij sessions running" >&2
   exit 3
