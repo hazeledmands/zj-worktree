@@ -45,8 +45,18 @@ fi
 today="$(date +%Y-%m-%d)"
 
 parse_field() {
-    # parse_field <file> <key> — strip "<key>: " from first matching line.
-    sed -n "s/^$2: //p" "$1" | head -1
+    # parse_field <file> <key> — print the first "<key>: ..." line, stripped of
+    # the key prefix, or nothing if absent. Pure bash builtins by design: the
+    # naive `sed -n ... | head -1` form forks two procs per call, and this is
+    # called ~8x per entry inside the emit loop — so on a 500-entry archive
+    # the fork cost alone is multiple seconds.
+    local line key="$2"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key: "* ]]; then
+            printf '%s\n' "${line#"$key: "}"
+            return
+        fi
+    done < "$1"
 }
 
 reap_entry() {
@@ -82,13 +92,21 @@ reap_entry() {
 }
 
 extract_hook() {
-    # First non-blank body line, truncated to 140 chars.
-    awk '
-        BEGIN { state = 0 }
-        state == 0 && /^---$/ { state = 1; next }
-        state == 1 && /^---$/ { state = 2; next }
-        state == 2 && NF > 0  { print; exit }
-    ' "$1" | head -c 140
+    # First non-blank body line (any non-whitespace content), truncated to 140
+    # chars. Pure bash builtins — same fork-cost concern as parse_field.
+    local line state=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$state" in
+            0) [[ "$line" == "---" ]] && state=1 ;;
+            1) [[ "$line" == "---" ]] && state=2 ;;
+            2)
+                if [[ "$line" == *[![:space:]]* ]]; then
+                    printf '%s' "${line:0:140}"
+                    return
+                fi
+                ;;
+        esac
+    done < "$1"
 }
 
 # Pass 1: reap each entry in place.

@@ -387,19 +387,26 @@ fi
 echo ""
 echo "=== agent-friendliness: SIGPIPE + result lines ==="
 
-# `zj-worktree list | head -1` should exit 0, not 141 (SIGPIPE). Use enough
-# entries that awk's output overflows the pipe buffer, forcing multiple
-# writes — otherwise the first write may flush everything before head closes
-# and the bug doesn't trigger.
+# `zj-worktree list | head -1` should exit 0, not 141 (SIGPIPE). Need awk's
+# output to overflow the pipe buffer (~64KB on macOS) so it does multiple
+# writes — otherwise the first write flushes everything before head closes
+# and the bug never triggers. 500 entries × ~230 chars/line = ~115KB, safely
+# 2x past the threshold while keeping setup quick.
+long_hook="entry body lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim"
 dir=$(mk_archive_dir)
-for i in $(seq 1 2000); do
+for i in $(seq 1 500); do
     mk_entry "$dir" "hound-e$i" "e$i" "hazel/longish-branch-name-for-bulk-$i" \
         "/tmp/zjwt-fake/e$i-some-long-path-here" "hound" archived \
-        2026-04-01 2026-05-01 2026-05-01 <<<"entry $i body lorem ipsum dolor sit amet"
+        2026-04-01 2026-05-01 2026-05-01 <<<"$long_hook"
 done
-ARCHIVE_DIR="$dir" "$SCRIPT" list 2>/dev/null | head -1 >/dev/null || true
-rc=${PIPESTATUS[0]}
+rc=0
+{ ARCHIVE_DIR="$dir" "$SCRIPT" list 2>/dev/null | head -1 >/dev/null; } || rc=${PIPESTATUS[0]}
 rm -rf "$dir"
+# NOTE: `cmd | head | true` resets PIPESTATUS to just `true`'s status, so
+# `rc=${PIPESTATUS[0]}` on the next line reads 0 regardless of what `cmd`
+# actually did — the test then always passes, even with a regressed script.
+# Capture the pipeline's status in the `||` branch instead, so it's read
+# before any subsequent command overwrites PIPESTATUS.
 if (( rc == 0 )); then
     pass "list piped into head -1 exits 0 (SIGPIPE tolerated)"
 else
