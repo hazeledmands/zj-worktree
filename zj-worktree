@@ -170,9 +170,25 @@ cmd_create() {
 
     # --- Validation ---
 
+    # $ZELLIJ is only set inside a zellij pane. Detached contexts (e.g. an
+    # agent background job) don't inherit it, but can still drive a running
+    # session: `zellij action` targets whatever $ZELLIJ_SESSION_NAME names.
+    # So don't hard-fail on an empty $ZELLIJ — resolve a live session instead.
     if [[ -z "${ZELLIJ:-}" ]]; then
-        echo "Error: not inside a zellij session" >&2
-        exit 1
+        local live_sessions
+        live_sessions=$(zellij list-sessions 2>/dev/null \
+            | sed -E 's/\x1b\[[0-9;]*m//g' \
+            | grep -v 'EXITED' \
+            | awk '{print $1}')
+        if [[ -n "${ZELLIJ_SESSION_NAME:-}" ]] && grep -qxF "$ZELLIJ_SESSION_NAME" <<<"$live_sessions"; then
+            : # $ZELLIJ_SESSION_NAME already points at a live session
+        elif [[ "$(grep -c . <<<"$live_sessions")" -eq 1 ]]; then
+            export ZELLIJ_SESSION_NAME="$live_sessions"
+        else
+            echo "Error: not inside a zellij session, and could not resolve a single live one to target." >&2
+            echo "       Set ZELLIJ_SESSION_NAME to a running session and retry." >&2
+            exit 1
+        fi
     fi
 
     if [[ -z "$tab_name" ]]; then
