@@ -176,10 +176,12 @@ cmd_create() {
     # So don't hard-fail on an empty $ZELLIJ — resolve a live session instead.
     if [[ -z "${ZELLIJ:-}" ]]; then
         local live_sessions
+        # `|| :` — with no live sessions, grep exits 1 and set -e would kill
+        # us before the friendly error below could print.
         live_sessions=$(zellij list-sessions 2>/dev/null \
             | sed -E 's/\x1b\[[0-9;]*m//g' \
             | grep -v 'EXITED' \
-            | awk '{print $1}')
+            | awk '{print $1}') || :
         if [[ -n "${ZELLIJ_SESSION_NAME:-}" ]] && grep -qxF "$ZELLIJ_SESSION_NAME" <<<"$live_sessions"; then
             : # $ZELLIJ_SESSION_NAME already points at a live session
         elif [[ "$(grep -c . <<<"$live_sessions")" -eq 1 ]]; then
@@ -265,7 +267,9 @@ cmd_create() {
             base_flag=(--base "$base")
         else
             local default_branch
-            default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+            # `|| :` — repos wired via `git remote add` (not clone) may lack
+            # origin/HEAD; set -e would kill us here before the fallback runs.
+            default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||') || :
             default_branch="${default_branch:-main}"
             progress "◎ Fetching ${default_branch} from origin..."
             # Capture so any --quiet-bypassed writes don't share our stdout.

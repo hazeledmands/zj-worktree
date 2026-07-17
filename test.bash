@@ -54,6 +54,40 @@ mk_entry() {
     } > "$dir/$slug.md"
 }
 
+# mk_zellij_stub <dir> — drop a tiny zellij replacement at <dir>/zellij that
+# replies from canned files. Stub responds to two invocations:
+#   `zellij list-sessions [--no-formatting]` → cat <dir>/sessions
+#   `zellij -s SESSION action list-panes --json` → cat <dir>/panes/SESSION,
+#     OR, if no such file, fall through to cat <dir>/sessions (mirroring real
+#     zellij's behaviour against a stale session — which is the bug fix in
+#     find-tab.sh: those non-JSON falls-through used to crash jq).
+mk_zellij_stub() {
+    local d="$1"
+    mkdir -p "$d/panes"
+    cat > "$d/zellij" <<'STUB'
+#!/usr/bin/env bash
+here="$(dirname "$0")"
+case "$1" in
+    list-sessions)
+        cat "$here/sessions"
+        ;;
+    -s)
+        session="$2"
+        if [[ -f "$here/panes/$session" ]]; then
+            cat "$here/panes/$session"
+        else
+            cat "$here/sessions"
+        fi
+        ;;
+    *)
+        echo "stub-zellij: unhandled args: $*" >&2
+        exit 2
+        ;;
+esac
+STUB
+    chmod +x "$d/zellij"
+}
+
 echo "=== Argument parsing & validation ==="
 
 # --help should print usage and exit 0
@@ -103,8 +137,15 @@ else
     fail "unknown option is rejected (got: $out)"
 fi
 
-# Not inside zellij should fail (ZELLIJ env var unset)
-out=$(ZELLIJ="" "$SCRIPT" --branch foo --tab bar 2>&1) || true
+# Not inside zellij should fail (ZELLIJ env var unset). Must be hermetic:
+# with a live session on the host, the script would resolve it and dispatch a
+# REAL tab — so stub zellij to report no live sessions and clear
+# ZELLIJ_SESSION_NAME.
+dir=$(mktemp -d)
+mk_zellij_stub "$dir"
+: > "$dir/sessions"
+out=$(ZELLIJ="" ZELLIJ_SESSION_NAME="" PATH="$dir:$PATH" "$SCRIPT" --branch foo --tab bar 2>&1) || true
+rm -rf "$dir"
 if echo "$out" | grep -q "Error: not inside a zellij session"; then
     pass "not inside zellij is rejected"
 else
@@ -530,39 +571,7 @@ fi
 echo ""
 echo "=== lib/find-tab.sh (stubbed zellij) ==="
 
-# mk_zellij_stub <dir> — drop a tiny zellij replacement at <dir>/zellij that
-# replies from canned files. Stub responds to two invocations:
-#   `zellij list-sessions [--no-formatting]` → cat <dir>/sessions
-#   `zellij -s SESSION action list-panes --json` → cat <dir>/panes/SESSION,
-#     OR, if no such file, fall through to cat <dir>/sessions (mirroring real
-#     zellij's behaviour against a stale session — which is the bug fix in
-#     find-tab.sh: those non-JSON falls-through used to crash jq).
-mk_zellij_stub() {
-    local d="$1"
-    mkdir -p "$d/panes"
-    cat > "$d/zellij" <<'STUB'
-#!/usr/bin/env bash
-here="$(dirname "$0")"
-case "$1" in
-    list-sessions)
-        cat "$here/sessions"
-        ;;
-    -s)
-        session="$2"
-        if [[ -f "$here/panes/$session" ]]; then
-            cat "$here/panes/$session"
-        else
-            cat "$here/sessions"
-        fi
-        ;;
-    *)
-        echo "stub-zellij: unhandled args: $*" >&2
-        exit 2
-        ;;
-esac
-STUB
-    chmod +x "$d/zellij"
-}
+# (mk_zellij_stub is defined with the other helpers at the top of the file.)
 
 # Regression: EXITED sessions in the listing must not reach jq. Three stale
 # entries + one live session — find-tab must skip all three stale ones, hit
@@ -688,6 +697,46 @@ if (( rc == 1 )); then
 else
     fail "find-tab: panes with null pane_cwd are ignored when matching (rc=$rc)"
 fi
+
+echo ""
+echo "=== default-branch resolution ==="
+
+# Regression: a repo whose remote lacks the origin/HEAD symbolic ref (the
+# shape `git remote add` + `git fetch` produces, unlike `git clone`) must not
+# die at default-branch resolution. Under set -e the failing command
+# substitution used to kill the script with git's 128 before the `:-main`
+# fallback could run. The wt stub proves we got past that line and stops the
+# run before any tab is dispatched.
+dir=$(mktemp -d)
+mk_zellij_stub "$dir"
+: > "$dir/sessions"
+cat > "$dir/wt" <<'STUB'
+#!/usr/bin/env bash
+echo "wt-stub-reached: $*"
+exit 1
+STUB
+chmod +x "$dir/wt"
+git init -q --bare "$dir/origin.git"
+git init -q -b main "$dir/repo"
+git -C "$dir/repo" -c user.name=t -c user.email=t@t.invalid commit -q --allow-empty -m init
+git -C "$dir/repo" remote add origin "$dir/origin.git"
+git -C "$dir/repo" push -q origin main
+git -C "$dir/repo" fetch -q origin
+# Newer git auto-creates origin/HEAD on fetch; delete it to model repos wired
+# up under older git (the real-world shape that hit this bug).
+git -C "$dir/repo" remote set-head origin --delete
+if git -C "$dir/repo" symbolic-ref -q refs/remotes/origin/HEAD >/dev/null; then
+    fail "missing-origin/HEAD fixture: expected origin/HEAD to be unset"
+else
+    rc=0
+    out=$(ZELLIJ=1 PATH="$dir:$PATH" "$SCRIPT" --repo "$dir/repo" --branch t/branch --tab t-tab --prompt hi 2>&1) || rc=$?
+    if [[ "$out" == *"wt-stub-reached"* ]]; then
+        pass "missing origin/HEAD falls back to main instead of dying"
+    else
+        fail "missing origin/HEAD falls back to main instead of dying (rc=$rc, out: $out)"
+    fi
+fi
+rm -rf "$dir"
 
 echo ""
 if [[ "$failures" -eq 0 ]]; then
